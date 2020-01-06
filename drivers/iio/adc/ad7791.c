@@ -18,7 +18,6 @@
 #include <linux/sched.h>
 #include <linux/delay.h>
 #include <linux/module.h>
-#include <linux/of.h>
 
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
@@ -154,10 +153,15 @@ struct ad7791_state {
 	const struct ad7791_chip_info *info;
 };
 
-static struct ad7791_platform_data ad7791_default_pdata = {
-	.buffered = true,
-	.burnout_current = false,
-	.unipolar = false,
+static const int ad7791_sample_freq_avail[8][2] = {
+	[AD7791_FILTER_RATE_120] =  { 120, 0 },
+	[AD7791_FILTER_RATE_100] =  { 100, 0 },
+	[AD7791_FILTER_RATE_33_3] = { 33,  300000 },
+	[AD7791_FILTER_RATE_20] =   { 20,  0 },
+	[AD7791_FILTER_RATE_16_6] = { 16,  600000 },
+	[AD7791_FILTER_RATE_16_7] = { 16,  700000 },
+	[AD7791_FILTER_RATE_13_3] = { 13,  300000 },
+	[AD7791_FILTER_RATE_9_5] =  { 9,   500000 },
 };
 
 static struct ad7791_state *ad_sigma_delta_to_ad7791(struct ad_sigma_delta *sd)
@@ -165,8 +169,7 @@ static struct ad7791_state *ad_sigma_delta_to_ad7791(struct ad_sigma_delta *sd)
 	return container_of(sd, struct ad7791_state, sd);
 }
 
-static int ad7791_set_channel(struct ad_sigma_delta *sd, unsigned int slot,
-	unsigned int channel)
+static int ad7791_set_channel(struct ad_sigma_delta *sd, unsigned int channel)
 {
 	ad_sd_set_comm(sd, channel);
 
@@ -210,6 +213,7 @@ static int ad7791_read_raw(struct iio_dev *indio_dev,
 {
 	struct ad7791_state *st = iio_priv(indio_dev);
 	bool unipolar = !!(st->mode & AD7791_MODE_UNIPOLAR);
+	unsigned int rate;
 
 	switch (info) {
 	case IIO_CHAN_INFO_RAW:
@@ -247,63 +251,56 @@ static int ad7791_read_raw(struct iio_dev *indio_dev,
 			*val2 = chan->scan_type.realbits - 1;
 
 		return IIO_VAL_FRACTIONAL_LOG2;
+	case IIO_CHAN_INFO_SAMP_FREQ:
+		rate = st->filter & AD7791_FILTER_RATE_MASK;
+		*val = ad7791_sample_freq_avail[rate][0];
+		*val2 = ad7791_sample_freq_avail[rate][1];
+		return IIO_VAL_INT_PLUS_MICRO;
 	}
 
 	return -EINVAL;
 }
 
-static const char * const ad7791_sample_freq_avail[] = {
-	[AD7791_FILTER_RATE_120] = "120",
-	[AD7791_FILTER_RATE_100] = "100",
-	[AD7791_FILTER_RATE_33_3] = "33.3",
-	[AD7791_FILTER_RATE_20] = "20",
-	[AD7791_FILTER_RATE_16_6] = "16.6",
-	[AD7791_FILTER_RATE_16_7] = "16.7",
-	[AD7791_FILTER_RATE_13_3] = "13.3",
-	[AD7791_FILTER_RATE_9_5] = "9.5",
-};
-
-static ssize_t ad7791_read_frequency(struct device *dev,
-	struct device_attribute *attr, char *buf)
+static int ad7791_write_raw(struct iio_dev *indio_dev,
+	struct iio_chan_spec const *chan, int val, int val2, long mask)
 {
-	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct ad7791_state *st = iio_priv(indio_dev);
-	unsigned int rate = st->filter & AD7791_FILTER_RATE_MASK;
-
-	return sprintf(buf, "%s\n", ad7791_sample_freq_avail[rate]);
-}
-
-static ssize_t ad7791_write_frequency(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t len)
-{
-	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
-	struct ad7791_state *st = iio_priv(indio_dev);
-	int i, ret;
-
-	i = sysfs_match_string(ad7791_sample_freq_avail, buf);
-	if (i < 0)
-		return i;
+	int ret, i;
 
 	ret = iio_device_claim_direct_mode(indio_dev);
 	if (ret)
 		return ret;
-	st->filter &= ~AD7791_FILTER_RATE_MASK;
-	st->filter |= i;
-	ad_sd_write_reg(&st->sd, AD7791_REG_FILTER, sizeof(st->filter),
-			st->filter);
+
+	switch (mask) {
+	case IIO_CHAN_INFO_SAMP_FREQ:
+		for (i = 0; i < ARRAY_SIZE(ad7791_sample_freq_avail); i++) {
+			if (ad7791_sample_freq_avail[i][0] == val &&
+			    ad7791_sample_freq_avail[i][1] == val2)
+				break;
+		}
+
+		if (i == ARRAY_SIZE(ad7791_sample_freq_avail)) {
+			ret = -EINVAL;
+			break;
+		}
+
+		st->filter &= ~AD7791_FILTER_RATE_MASK;
+		st->filter |= i;
+		ad_sd_write_reg(&st->sd, AD7791_REG_FILTER,
+				sizeof(st->filter),
+				st->filter);
+		break;
+	default:
+		ret = -EINVAL;
+	}
+
 	iio_device_release_direct_mode(indio_dev);
-
-	return len;
+	return ret;
 }
-
-static IIO_DEV_ATTR_SAMP_FREQ(S_IWUSR | S_IRUGO,
-		ad7791_read_frequency,
-		ad7791_write_frequency);
 
 static IIO_CONST_ATTR_SAMP_FREQ_AVAIL("120 100 33.3 20 16.7 16.6 13.3 9.5");
 
 static struct attribute *ad7791_attributes[] = {
-	&iio_dev_attr_sampling_frequency.dev_attr.attr,
 	&iio_const_attr_sampling_frequency_available.dev_attr.attr,
 	NULL
 };
@@ -314,34 +311,26 @@ static const struct attribute_group ad7791_attribute_group = {
 
 static const struct iio_info ad7791_info = {
 	.read_raw = &ad7791_read_raw,
+	.write_raw = &ad7791_write_raw,
 	.attrs = &ad7791_attribute_group,
 	.validate_trigger = ad_sd_validate_trigger,
-	.driver_module = THIS_MODULE,
 };
 
 static const struct iio_info ad7791_no_filter_info = {
 	.read_raw = &ad7791_read_raw,
+	.write_raw = &ad7791_write_raw,
 	.validate_trigger = ad_sd_validate_trigger,
-	.driver_module = THIS_MODULE,
 };
 
 static int ad7791_setup(struct ad7791_state *st,
 			struct ad7791_platform_data *pdata)
 {
-	int ret;
-
 	/* Set to poweron-reset default values */
 	st->mode = AD7791_MODE_BUFFER;
 	st->filter = AD7791_FILTER_RATE_16_6;
 
 	if (!pdata)
 		return 0;
-	/* reset the serial interface */
-	ret = -1;
-	ret = spi_write(st->sd.spi, (u8 *)&ret, sizeof(ret));
-	if (ret < 0)
-		return ret;
-	usleep_range(500, 2000); /* Wait for at least 500us */
 
 	if ((st->info->flags & AD7791_FLAG_HAS_BUFFER) && !pdata->buffered)
 		st->mode &= ~AD7791_MODE_BUFFER;
@@ -357,48 +346,12 @@ static int ad7791_setup(struct ad7791_state *st,
 		st->mode);
 }
 
-#ifdef CONFIG_OF
-static struct ad7791_platform_data *ad7791_parse_dt(struct device *dev)
-{
-	struct device_node *np = dev->of_node;
-	struct ad7791_platform_data *pdata;
-
-	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata) {
-		dev_err(dev, "could not allocate memory for platform data\n");
-		return NULL;
-	}
-
-	pdata->buffered = of_property_read_bool(np, "adi,buffered-mode-enable");
-	pdata->burnout_current = of_property_read_bool(np, "adi,burnout-current-enable");
-	pdata->unipolar = of_property_read_bool(np, "adi,unipolar-mode-enable");
-
-	return pdata;
-}
-#else
-static
-struct ad7791_platform_data *ad7791_parse_dt(struct device *dev)
-{
-	return NULL;
-}
-#endif
-
 static int ad7791_probe(struct spi_device *spi)
 {
-	struct ad7791_platform_data *pdata;
+	struct ad7791_platform_data *pdata = spi->dev.platform_data;
 	struct iio_dev *indio_dev;
 	struct ad7791_state *st;
 	int ret;
-
-	if (spi->dev.of_node)
-		pdata = ad7791_parse_dt(&spi->dev);
-	else
-		pdata = spi->dev.platform_data;
-
-	if (!pdata) {
-		dev_err(&spi->dev, "no platform data? using default\n");
-		pdata = &ad7791_default_pdata;
-	}
 
 	if (!spi->irq) {
 		dev_err(&spi->dev, "Missing IRQ.\n");

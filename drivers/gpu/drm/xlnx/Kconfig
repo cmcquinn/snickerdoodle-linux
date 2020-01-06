@@ -33,6 +33,8 @@ config DRM_XLNX_BRIDGE_DEBUG_FS
 config DRM_ZYNQMP_DPSUB
 	tristate "ZynqMP DP Subsystem Driver"
 	depends on ARCH_ZYNQMP && OF && DRM_XLNX && COMMON_CLK
+	select DMADEVICES
+	select XILINX_DMA_ENGINES
 	select XILINX_DPDMA
 	select PHY_XILINX_ZYNQMP
 	help
@@ -55,12 +57,14 @@ config DRM_XLNX_DSI
 config DRM_XLNX_MIXER
 	tristate "Xilinx DRM Mixer Driver"
 	depends on DRM_XLNX
+	select VIDEOMODE_HELPERS
 	help
 	  DRM driver for Xilinx Mixer driver
 
 config DRM_XLNX_PL_DISP
 	tristate "Xilinx DRM PL display driver"
 	depends on DRM_XLNX
+	select VIDEOMODE_HELPERS
 	help
 	  DRM driver for Xilinx PL display driver, provides drm
 	  crtc and plane object to display pipeline. You need to

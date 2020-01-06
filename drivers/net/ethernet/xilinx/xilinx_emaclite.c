@@ -17,6 +17,7 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
+#include <linux/ethtool.h>
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/of_address.h>
@@ -412,7 +413,8 @@ static u16 xemaclite_recv_data(struct net_local *drvdata, u8 *data, int maxlen)
 			return 0;	/* No data was available */
 	}
 
-	/* Get the protocol type of the ethernet frame that arrived */
+	/* Get the protocol type of the ethernet frame that arrived
+	 */
 	proto_type = ((ntohl(xemaclite_readl(addr + XEL_HEADER_OFFSET +
 			XEL_RXBUFF_OFFSET)) >> XEL_HEADER_SHIFT) &
 			XEL_RPLR_LENGTH_MASK);
@@ -572,18 +574,19 @@ static void xemaclite_tx_handler(struct net_device *dev)
 	struct net_local *lp = netdev_priv(dev);
 
 	dev->stats.tx_packets++;
-	if (lp->deferred_skb) {
-		if (xemaclite_send_data(lp,
-					(u8 *)lp->deferred_skb->data,
-					lp->deferred_skb->len) != 0)
-			return;
 
-		dev->stats.tx_bytes += lp->deferred_skb->len;
-		dev_kfree_skb_irq(lp->deferred_skb);
-		lp->deferred_skb = NULL;
-		netif_trans_update(dev); /* prevent tx timeout */
-		netif_wake_queue(dev);
-	}
+	if (!lp->deferred_skb)
+		return;
+
+	if (xemaclite_send_data(lp, (u8 *)lp->deferred_skb->data,
+				lp->deferred_skb->len))
+		return;
+
+	dev->stats.tx_bytes += lp->deferred_skb->len;
+	dev_kfree_skb_irq(lp->deferred_skb);
+	lp->deferred_skb = NULL;
+	netif_trans_update(dev); /* prevent tx timeout */
+	netif_wake_queue(dev);
 }
 
 /**
@@ -646,7 +649,7 @@ static void xemaclite_rx_handler(struct net_device *dev)
  * @dev_id:	Void pointer to the network device instance used as callback
  *		reference
  *
- * Return: IRQ_HANDLED.
+ * Return:	IRQ_HANDLED
  *
  * This function handles the Tx and Rx interrupts of the EmacLite device.
  */
@@ -765,8 +768,8 @@ static int xemaclite_mdio_read(struct mii_bus *bus, int phy_id, int reg)
 	rc = xemaclite_readl(lp->base_addr + XEL_MDIORD_OFFSET);
 
 	dev_dbg(&lp->ndev->dev,
-		"%s(phy_id=%i, reg=%x) == %x\n",
-		__func__, phy_id, reg, rc);
+		"%s(phy_id=%i, reg=%x) == %x\n", __func__,
+		phy_id, reg, rc);
 
 	return rc;
 }
@@ -790,8 +793,8 @@ static int xemaclite_mdio_write(struct mii_bus *bus, int phy_id, int reg,
 	u32 ctrl_reg;
 
 	dev_dbg(&lp->ndev->dev,
-		"%s(phy_id=%i, reg=%x, val=%x)\n",
-		__func__, phy_id, reg, val);
+		"%s(phy_id=%i, reg=%x, val=%x)\n", __func__,
+		phy_id, reg, val);
 
 	if (xemaclite_mdio_wait(lp))
 		return -ETIMEDOUT;
@@ -913,13 +916,12 @@ static void xemaclite_adjust_link(struct net_device *ndev)
  * xemaclite_open - Open the network device
  * @dev:	Pointer to the network device
  *
- * Return: 0, on success.
- *	    -ENODEV, if PHY cannot be connected to
- *	    non-zero error value on failure
- *
  * This function sets the MAC address, requests an IRQ and enables interrupts
  * for the Emaclite device and starts the Tx queue.
  * It also connects to the phy device, if MDIO is included in Emaclite device.
+ *
+ * Return:	0 on success. -ENODEV, if PHY cannot be connected.
+ *		Non-zero error value on failure.
  */
 static int xemaclite_open(struct net_device *dev)
 {
@@ -1070,17 +1072,34 @@ static bool get_bool(struct platform_device *ofdev, const char *s)
 {
 	u32 *p = (u32 *)of_get_property(ofdev->dev.of_node, s, NULL);
 
-	if (p) {
-		goto out;
-	} else {
-		dev_warn(&ofdev->dev, "Parameter %s not found", s);
-		dev_warn(&ofdev->dev, " defaulting to false\n");
+	if (!p) {
+		dev_warn(&ofdev->dev, "Parameter %s not found, defaulting to false\n", s);
 		return false;
 	}
 
-out:
 	return (bool)*p;
 }
+
+/**
+ * xemaclite_ethtools_get_drvinfo - Get various Axi Emac Lite driver info
+ * @ndev:       Pointer to net_device structure
+ * @ed:         Pointer to ethtool_drvinfo structure
+ *
+ * This implements ethtool command for getting the driver information.
+ * Issue "ethtool -i ethX" under linux prompt to execute this function.
+ */
+static void xemaclite_ethtools_get_drvinfo(struct net_device *ndev,
+					   struct ethtool_drvinfo *ed)
+{
+	strlcpy(ed->driver, DRIVER_NAME, sizeof(ed->driver));
+}
+
+static const struct ethtool_ops xemaclite_ethtool_ops = {
+	.get_drvinfo    = xemaclite_ethtools_get_drvinfo,
+	.get_link       = ethtool_op_get_link,
+	.get_link_ksettings = phy_ethtool_get_link_ksettings,
+	.set_link_ksettings = phy_ethtool_set_link_ksettings,
+};
 
 static const struct net_device_ops xemaclite_netdev_ops;
 
@@ -1168,6 +1187,7 @@ static int xemaclite_of_probe(struct platform_device *ofdev)
 	dev_info(dev, "MAC address is now %pM\n", ndev->dev_addr);
 
 	ndev->netdev_ops = &xemaclite_netdev_ops;
+	ndev->ethtool_ops = &xemaclite_ethtool_ops;
 	ndev->flags &= ~IFF_MULTICAST;
 	ndev->watchdog_timeo = TX_TIMEOUT;
 
@@ -1233,12 +1253,29 @@ xemaclite_poll_controller(struct net_device *ndev)
 }
 #endif
 
+/* Ioctl MII Interface */
+static int xemaclite_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+{
+	if (!dev->phydev || !netif_running(dev))
+		return -EINVAL;
+
+	switch (cmd) {
+	case SIOCGMIIPHY:
+	case SIOCGMIIREG:
+	case SIOCSMIIREG:
+		return phy_mii_ioctl(dev->phydev, rq, cmd);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static const struct net_device_ops xemaclite_netdev_ops = {
 	.ndo_open		= xemaclite_open,
 	.ndo_stop		= xemaclite_close,
 	.ndo_start_xmit		= xemaclite_send,
 	.ndo_set_mac_address	= xemaclite_set_mac_address,
 	.ndo_tx_timeout		= xemaclite_tx_timeout,
+	.ndo_do_ioctl		= xemaclite_ioctl,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller = xemaclite_poll_controller,
 #endif

@@ -18,6 +18,7 @@
  * Should be integrated with plane.
  */
 
+#include <linux/clk.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/gpio/consumer.h>
@@ -32,6 +33,8 @@
 #define XSCALER_MAX_WIDTH		(3840)
 #define XSCALER_MAX_HEIGHT		(2160)
 #define XSCALER_MAX_PHASES		(64)
+#define XSCALER_MIN_WIDTH		(64)
+#define XSCALER_MIN_HEIGHT		(64)
 
 /* Video subsytems block offset */
 #define S_AXIS_RESET_OFF		(0x00010000)
@@ -118,6 +121,7 @@
 #define XV_HSCALER_CTRL_ADDR_HWREG_PHASESH_V_HIGH	(0x3fff)
 #define XV_HSCALER_CTRL_WIDTH_HWREG_PHASESH_V		(18)
 #define XV_HSCALER_CTRL_DEPTH_HWREG_PHASESH_V		(1920)
+#define XV_HSCALER_CTRL_ADDR_HWREG_PHASEH_FIX		(0x4000)
 
 /* H-scaler masks */
 #define XV_HSCALER_PHASESH_V_OUTPUT_WR_EN		BIT(8)
@@ -695,6 +699,17 @@ static const u32 xilinx_scaler_video_fmts[] = {
 	MEDIA_BUS_FMT_VYYUYY8_1X24,
 };
 
+/* This bit is for xscaler feature flag */
+#define XSCALER_HPHASE_FIX	BIT(0)
+
+/**
+ * struct xscaler_feature - dt or IP property structure
+ * @flags: Bitmask of properties enabled in IP or dt
+ */
+struct xscaler_feature {
+	u32 flags;
+};
+
 /**
  * struct xilinx_scaler - Core configuration of scaler device structure
  * @base: pointer to register base address
@@ -717,6 +732,9 @@ static const u32 xilinx_scaler_video_fmts[] = {
  * @vscaler_coeff: The complete array of V-scaler coefficients
  * @is_polyphase: Track if scaling algorithm is polyphase or not
  * @rst_gpio: GPIO reset line to bring VPSS Scaler out of reset
+ * @ctrl_clk: AXI Lite clock
+ * @axis_clk: Video Clock
+ * @cfg: Pointer to scaler config structure
  */
 struct xilinx_scaler {
 	void __iomem *base;
@@ -739,6 +757,9 @@ struct xilinx_scaler {
 	short vscaler_coeff[XV_VSCALER_MAX_V_PHASES][XV_VSCALER_MAX_V_TAPS];
 	bool is_polyphase;
 	struct gpio_desc *rst_gpio;
+	struct clk *ctrl_clk;
+	struct clk *axis_clk;
+	const struct xscaler_feature *cfg;
 };
 
 static inline void xilinx_scaler_write(void __iomem *base, u32 offset, u32 val)
@@ -1059,10 +1080,11 @@ xv_vscaler_load_ext_coeff(struct xilinx_scaler *scaler,
 			/* pad left */
 			for (j = 0; j < offset; j++)
 				scaler->vscaler_coeff[i][j] = 0;
+			/* pad right */
+			j = ntaps + offset;
+			for (; j < XV_VSCALER_MAX_V_TAPS; j++)
+				scaler->vscaler_coeff[i][j] = 0;
 		}
-		/* pad right */
-		for (j = (ntaps + offset); j < XV_VSCALER_MAX_V_TAPS; j++)
-			scaler->vscaler_coeff[i][j] = 0;
 	}
 }
 
@@ -1201,7 +1223,13 @@ xv_hscaler_set_phases(struct xilinx_scaler *scaler)
 	u32 offset, i, lsb, msb;
 
 	loop_width = scaler->max_pixels / scaler->pix_per_clk;
-	offset = V_HSCALER_OFF + XV_HSCALER_CTRL_ADDR_HWREG_PHASESH_V_BASE;
+	if (scaler->cfg->flags & XSCALER_HPHASE_FIX) {
+		offset = V_HSCALER_OFF +
+			XV_HSCALER_CTRL_ADDR_HWREG_PHASEH_FIX;
+	} else {
+		offset = V_HSCALER_OFF +
+			XV_HSCALER_CTRL_ADDR_HWREG_PHASESH_V_BASE;
+	}
 
 	switch (scaler->pix_per_clk) {
 	case XSCALER_PPC_1:
@@ -1335,6 +1363,20 @@ static int xilinx_scaler_parse_of(struct xilinx_scaler *scaler)
 	u32 dt_ppc;
 	struct device_node *node = scaler->dev->of_node;
 
+	scaler->ctrl_clk = devm_clk_get(scaler->dev, "aclk_ctrl");
+	if (IS_ERR(scaler->ctrl_clk)) {
+		ret = PTR_ERR(scaler->ctrl_clk);
+		dev_err(scaler->dev, "failed to get axi lite clk %d\n", ret);
+		return ret;
+	}
+
+	scaler->axis_clk = devm_clk_get(scaler->dev, "aclk_axis");
+	if (IS_ERR(scaler->axis_clk)) {
+		ret = PTR_ERR(scaler->axis_clk);
+		dev_err(scaler->dev, "failed to get video clk %d\n", ret);
+		return ret;
+	}
+
 	ret = of_property_read_u32(node, "xlnx,h-scaler-taps",
 				   &scaler->num_hori_taps);
 	if (ret < 0) {
@@ -1396,6 +1438,28 @@ static int xilinx_scaler_parse_of(struct xilinx_scaler *scaler)
 		if (PTR_ERR(scaler->rst_gpio) != -EPROBE_DEFER)
 			dev_err(scaler->dev, "Reset GPIO not setup in DT");
 		return PTR_ERR(scaler->rst_gpio);
+	}
+
+	ret = of_property_read_u32(node, "xlnx,max-height",
+				   &scaler->max_lines);
+	if (ret < 0) {
+		dev_err(scaler->dev, "xlnx,max-height is missing!");
+		return -EINVAL;
+	} else if (scaler->max_lines > XSCALER_MAX_HEIGHT ||
+		   scaler->max_lines < XSCALER_MIN_HEIGHT) {
+		dev_err(scaler->dev, "Invalid height in dt");
+		return -EINVAL;
+	}
+
+	ret = of_property_read_u32(node, "xlnx,max-width",
+				   &scaler->max_pixels);
+	if (ret < 0) {
+		dev_err(scaler->dev, "xlnx,max-width is missing!");
+		return -EINVAL;
+	} else if (scaler->max_pixels > XSCALER_MAX_WIDTH ||
+		   scaler->max_pixels < XSCALER_MIN_WIDTH) {
+		dev_err(scaler->dev, "Invalid width in dt");
+		return -EINVAL;
 	}
 
 	return 0;
@@ -1605,17 +1669,44 @@ static int xilinx_scaler_bridge_get_output_fmts(struct xlnx_bridge *bridge,
 	return 0;
 }
 
+static const struct xscaler_feature xlnx_scaler_v2_2 = {
+	.flags = XSCALER_HPHASE_FIX,
+};
+
+static const struct xscaler_feature xlnx_scaler = {
+	.flags = 0,
+};
+
+static const struct of_device_id xilinx_scaler_of_match[] = {
+	{ .compatible = "xlnx,vpss-scaler",
+		.data = &xlnx_scaler},
+	{ .compatible = "xlnx,vpss-scaler-2.2",
+		.data = &xlnx_scaler_v2_2},
+	{ }
+};
+
+MODULE_DEVICE_TABLE(of, xilinx_scaler_of_match);
+
 static int xilinx_scaler_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct resource *res;
 	struct xilinx_scaler *scaler;
+	const struct of_device_id *match;
+	struct device_node *node = pdev->dev.of_node;
 	int ret;
 
 	scaler = devm_kzalloc(dev, sizeof(*scaler), GFP_KERNEL);
 	if (!scaler)
 		return -ENOMEM;
 	scaler->dev = dev;
+
+	match = of_match_node(xilinx_scaler_of_match, node);
+	if (!match)
+		return -ENODEV;
+
+	scaler->cfg = match->data;
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	scaler->base = devm_ioremap_resource(dev, res);
 	if (IS_ERR(scaler->base)) {
@@ -1629,9 +1720,20 @@ static int xilinx_scaler_probe(struct platform_device *pdev)
 		dev_info(scaler->dev, "parse_of failed\n");
 		return ret;
 	}
+
+	ret = clk_prepare_enable(scaler->ctrl_clk);
+	if (ret) {
+		dev_err(scaler->dev, "unable to enable axi lite clk %d\n", ret);
+		return ret;
+	}
+
+	ret = clk_prepare_enable(scaler->axis_clk);
+	if (ret) {
+		dev_err(scaler->dev, "unable to enable video clk %d\n", ret);
+		goto err_ctrl_clk;
+	}
+
 	scaler->max_num_phases = XSCALER_MAX_PHASES;
-	scaler->max_lines = XSCALER_MAX_HEIGHT;
-	scaler->max_pixels = XSCALER_MAX_WIDTH;
 
 	/* Reset the Global IP Reset through a GPIO */
 	gpiod_set_value_cansleep(scaler->rst_gpio, XSCALER_RESET_DEASSERT);
@@ -1648,11 +1750,17 @@ static int xilinx_scaler_probe(struct platform_device *pdev)
 	ret = xlnx_bridge_register(&scaler->bridge);
 	if (ret) {
 		dev_info(scaler->dev, "Bridge registration failed\n");
-		return ret;
+		goto err_axis_clk;
 	}
 	dev_info(scaler->dev, "xlnx drm scaler experimental driver probed\n");
 
 	return 0;
+
+err_axis_clk:
+	clk_disable_unprepare(scaler->axis_clk);
+err_ctrl_clk:
+	clk_disable_unprepare(scaler->ctrl_clk);
+	return ret;
 }
 
 static int xilinx_scaler_remove(struct platform_device *pdev)
@@ -1660,14 +1768,10 @@ static int xilinx_scaler_remove(struct platform_device *pdev)
 	struct xilinx_scaler *scaler = platform_get_drvdata(pdev);
 
 	xlnx_bridge_unregister(&scaler->bridge);
+	clk_disable_unprepare(scaler->axis_clk);
+	clk_disable_unprepare(scaler->ctrl_clk);
 	return 0;
 }
-
-static const struct of_device_id xilinx_scaler_of_match[] = {
-	{ .compatible = "xlnx,vpss-scaler"},
-	{ }
-};
-MODULE_DEVICE_TABLE(of, xilinx_scaler_of_match);
 
 static struct platform_driver scaler_bridge_driver = {
 	.probe = xilinx_scaler_probe,

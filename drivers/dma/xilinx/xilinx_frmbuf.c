@@ -21,6 +21,7 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dma/xilinx_frmbuf.h>
 #include <linux/dmapool.h>
@@ -94,7 +95,9 @@
 #define XILINX_FRMBUF_FMT_BGRA8			26
 #define XILINX_FRMBUF_FMT_BGRX8			27
 #define XILINX_FRMBUF_FMT_UYVY8			28
-#define XILINX_FRMBUF_FMT_BGR8				29
+#define XILINX_FRMBUF_FMT_BGR8			29
+#define XILINX_FRMBUF_FMT_RGBX12		30
+#define XILINX_FRMBUF_FMT_RGB16			35
 
 /* FID Register */
 #define XILINX_FRMBUF_FID_MASK			BIT(0)
@@ -107,6 +110,12 @@
 #define XILINX_PPC_PROP				BIT(0)
 #define XILINX_FLUSH_PROP			BIT(1)
 #define XILINX_FID_PROP				BIT(2)
+#define XILINX_CLK_PROP				BIT(3)
+
+#define XILINX_FRMBUF_MAX_HEIGHT		(4320)
+#define XILINX_FRMBUF_MIN_HEIGHT		(64)
+#define XILINX_FRMBUF_MAX_WIDTH			(8192)
+#define XILINX_FRMBUF_MIN_WIDTH			(64)
 
 /**
  * struct xilinx_frmbuf_desc_hw - Hardware Descriptor
@@ -131,12 +140,14 @@ struct xilinx_frmbuf_desc_hw {
  * @hw: Hardware descriptor
  * @node: Node in the channel descriptors list
  * @fid: Field ID of buffer
+ * @earlycb: Whether the callback should be called when in staged state
  */
 struct xilinx_frmbuf_tx_descriptor {
 	struct dma_async_tx_descriptor async_tx;
 	struct xilinx_frmbuf_desc_hw hw;
 	struct list_head node;
 	u32 fid;
+	u32 earlycb;
 };
 
 /**
@@ -157,6 +168,7 @@ struct xilinx_frmbuf_tx_descriptor {
  * @tasklet: Cleanup work after irq
  * @vid_fmt: Reference to currently assigned video format description
  * @hw_fid: FID enabled in hardware flag
+ * @mode: Select operation mode
  */
 struct xilinx_frmbuf_chan {
 	struct xilinx_frmbuf_device *xdev;
@@ -177,6 +189,7 @@ struct xilinx_frmbuf_chan {
 	struct tasklet_struct tasklet;
 	const struct xilinx_frmbuf_format_desc *vid_fmt;
 	bool hw_fid;
+	enum operation_mode mode;
 };
 
 /**
@@ -436,6 +449,24 @@ static const struct xilinx_frmbuf_format_desc xilinx_frmbuf_formats[] = {
 		.v4l2_fmt = 0,
 		.fmt_bitmask = BIT(21),
 	},
+	{
+		.dts_name = "xbgr4121212",
+		.id = XILINX_FRMBUF_FMT_RGBX12,
+		.bpw = 40,
+		.ppw = 1,
+		.num_planes = 1,
+		.v4l2_fmt = V4L2_PIX_FMT_XBGR40,
+		.fmt_bitmask = BIT(22),
+	},
+	{
+		.dts_name = "rgb16",
+		.id = XILINX_FRMBUF_FMT_RGB16,
+		.bpw = 48,
+		.ppw = 1,
+		.num_planes = 1,
+		.v4l2_fmt = V4L2_PIX_FMT_BGR48,
+		.fmt_bitmask = BIT(23),
+	},
 };
 
 /**
@@ -461,6 +492,9 @@ struct xilinx_frmbuf_feature {
  * @v4l2_memory_fmts: Array of supported V4L2 fourcc codes
  * @v4l2_fmt_cnt: Count of supported V4L2 fourcc codes
  * @cfg: Pointer to Framebuffer Feature config struct
+ * @max_width: Maximum pixel width supported in IP.
+ * @max_height: Maximum number of lines supported in IP.
+ * @ap_clk: Video core clock
  */
 struct xilinx_frmbuf_device {
 	void __iomem *regs;
@@ -474,6 +508,9 @@ struct xilinx_frmbuf_device {
 	u32 v4l2_memory_fmts[ARRAY_SIZE(xilinx_frmbuf_formats)];
 	u32 v4l2_fmt_cnt;
 	const struct xilinx_frmbuf_feature *cfg;
+	u32 max_width;
+	u32 max_height;
+	struct clk *ap_clk;
 };
 
 static const struct xilinx_frmbuf_feature xlnx_fbwr_cfg_v20 = {
@@ -482,7 +519,8 @@ static const struct xilinx_frmbuf_feature xlnx_fbwr_cfg_v20 = {
 
 static const struct xilinx_frmbuf_feature xlnx_fbwr_cfg_v21 = {
 	.direction = DMA_DEV_TO_MEM,
-	.flags = XILINX_PPC_PROP | XILINX_FLUSH_PROP | XILINX_FID_PROP,
+	.flags = XILINX_PPC_PROP | XILINX_FLUSH_PROP
+		| XILINX_FID_PROP | XILINX_CLK_PROP,
 };
 
 static const struct xilinx_frmbuf_feature xlnx_fbrd_cfg_v20 = {
@@ -491,7 +529,8 @@ static const struct xilinx_frmbuf_feature xlnx_fbrd_cfg_v20 = {
 
 static const struct xilinx_frmbuf_feature xlnx_fbrd_cfg_v21 = {
 	.direction = DMA_MEM_TO_DEV,
-	.flags = XILINX_PPC_PROP | XILINX_FLUSH_PROP | XILINX_FID_PROP,
+	.flags = XILINX_PPC_PROP | XILINX_FLUSH_PROP
+		| XILINX_FID_PROP | XILINX_CLK_PROP,
 };
 
 static const struct of_device_id xilinx_frmbuf_of_ids[] = {
@@ -577,6 +616,29 @@ static void frmbuf_init_format_array(struct xilinx_frmbuf_device *xdev)
 	}
 }
 
+static struct xilinx_frmbuf_chan *frmbuf_find_chan(struct dma_chan *chan)
+{
+	struct xilinx_frmbuf_chan *xil_chan;
+	bool found_xchan = false;
+
+	mutex_lock(&frmbuf_chan_list_lock);
+	list_for_each_entry(xil_chan, &frmbuf_chan_list, chan_node) {
+		if (chan == &xil_chan->common) {
+			found_xchan = true;
+			break;
+		}
+	}
+	mutex_unlock(&frmbuf_chan_list_lock);
+
+	if (!found_xchan) {
+		dev_dbg(chan->device->dev,
+			"dma chan not a Video Framebuffer channel instance\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	return xil_chan;
+}
+
 static struct xilinx_frmbuf_device *frmbuf_find_dev(struct dma_chan *chan)
 {
 	struct xilinx_frmbuf_chan *xchan, *temp;
@@ -633,24 +695,11 @@ static int frmbuf_verify_format(struct dma_chan *chan, u32 fourcc, u32 type)
 static void xilinx_xdma_set_config(struct dma_chan *chan, u32 fourcc, u32 type)
 {
 	struct xilinx_frmbuf_chan *xil_chan;
-	bool found_xchan = false;
 	int ret;
 
-	mutex_lock(&frmbuf_chan_list_lock);
-	list_for_each_entry(xil_chan, &frmbuf_chan_list, chan_node) {
-		if (chan == &xil_chan->common) {
-			found_xchan = true;
-			break;
-		}
-	}
-	mutex_unlock(&frmbuf_chan_list_lock);
-
-	if (!found_xchan) {
-		dev_dbg(chan->device->dev,
-			"dma chan not a Video Framebuffer channel instance\n");
+	xil_chan = frmbuf_find_chan(chan);
+	if (IS_ERR(xil_chan))
 		return;
-	}
-
 	ret = frmbuf_verify_format(chan, fourcc, type);
 	if (ret == -EINVAL) {
 		dev_err(chan->device->dev,
@@ -659,6 +708,21 @@ static void xilinx_xdma_set_config(struct dma_chan *chan, u32 fourcc, u32 type)
 		return;
 	}
 }
+
+void xilinx_xdma_set_mode(struct dma_chan *chan, enum operation_mode
+			  mode)
+{
+	struct xilinx_frmbuf_chan *xil_chan;
+
+	xil_chan = frmbuf_find_chan(chan);
+	if (IS_ERR(xil_chan))
+		return;
+
+	xil_chan->mode = mode;
+
+	return;
+
+} EXPORT_SYMBOL_GPL(xilinx_xdma_set_mode);
 
 void xilinx_xdma_drm_config(struct dma_chan *chan, u32 drm_fourcc)
 {
@@ -755,6 +819,52 @@ int xilinx_xdma_set_fid(struct dma_chan *chan,
 	return 0;
 }
 EXPORT_SYMBOL(xilinx_xdma_set_fid);
+
+int xilinx_xdma_get_earlycb(struct dma_chan *chan,
+			    struct dma_async_tx_descriptor *async_tx,
+			    u32 *earlycb)
+{
+	struct xilinx_frmbuf_device *xdev;
+	struct xilinx_frmbuf_tx_descriptor *desc;
+
+	xdev = frmbuf_find_dev(chan);
+	if (IS_ERR(xdev))
+		return PTR_ERR(xdev);
+
+	if (!async_tx || !earlycb)
+		return -EINVAL;
+
+	desc = to_dma_tx_descriptor(async_tx);
+	if (!desc)
+		return -EINVAL;
+
+	*earlycb = desc->earlycb;
+	return 0;
+}
+EXPORT_SYMBOL(xilinx_xdma_get_earlycb);
+
+int xilinx_xdma_set_earlycb(struct dma_chan *chan,
+			    struct dma_async_tx_descriptor *async_tx,
+			    u32 earlycb)
+{
+	struct xilinx_frmbuf_device *xdev;
+	struct xilinx_frmbuf_tx_descriptor *desc;
+
+	if (!async_tx)
+		return -EINVAL;
+
+	xdev = frmbuf_find_dev(chan);
+	if (IS_ERR(xdev))
+		return PTR_ERR(xdev);
+
+	desc = to_dma_tx_descriptor(async_tx);
+	if (!desc)
+		return -EINVAL;
+
+	desc->earlycb = earlycb;
+	return 0;
+}
+EXPORT_SYMBOL(xilinx_xdma_set_earlycb);
 
 /**
  * of_dma_xilinx_xlate - Translation function
@@ -923,8 +1033,8 @@ static enum dma_status xilinx_frmbuf_tx_status(struct dma_chan *dchan,
 static void xilinx_frmbuf_halt(struct xilinx_frmbuf_chan *chan)
 {
 	frmbuf_clr(chan, XILINX_FRMBUF_CTRL_OFFSET,
-		   XILINX_FRMBUF_CTRL_AP_START |
-		   XILINX_FRMBUF_CTRL_AUTO_RESTART);
+			XILINX_FRMBUF_CTRL_AP_START |
+			chan->mode);
 	chan->idle = true;
 }
 
@@ -935,8 +1045,8 @@ static void xilinx_frmbuf_halt(struct xilinx_frmbuf_chan *chan)
 static void xilinx_frmbuf_start(struct xilinx_frmbuf_chan *chan)
 {
 	frmbuf_set(chan, XILINX_FRMBUF_CTRL_OFFSET,
-		   XILINX_FRMBUF_CTRL_AP_START |
-		   XILINX_FRMBUF_CTRL_AUTO_RESTART);
+			XILINX_FRMBUF_CTRL_AP_START |
+			chan->mode);
 	chan->idle = false;
 }
 
@@ -974,11 +1084,6 @@ static void xilinx_frmbuf_start_transfer(struct xilinx_frmbuf_chan *chan)
 	if (!chan->idle)
 		return;
 
-	if (chan->active_desc) {
-		xilinx_frmbuf_complete_descriptor(chan);
-		chan->active_desc = NULL;
-	}
-
 	if (chan->staged_desc) {
 		chan->active_desc = chan->staged_desc;
 		chan->staged_desc = NULL;
@@ -990,6 +1095,19 @@ static void xilinx_frmbuf_start_transfer(struct xilinx_frmbuf_chan *chan)
 	desc = list_first_entry(&chan->pending_list,
 				struct xilinx_frmbuf_tx_descriptor,
 				node);
+
+	if (desc->earlycb == EARLY_CALLBACK_START_DESC) {
+		dma_async_tx_callback callback;
+		void *callback_param;
+
+		callback = desc->async_tx.callback;
+		callback_param = desc->async_tx.callback_param;
+		if (callback) {
+			callback(callback_param);
+			desc->async_tx.callback = NULL;
+			chan->active_desc = desc;
+		}
+	}
 
 	/* Start the transfer */
 	chan->write_addr(chan, XILINX_FRMBUF_ADDR_OFFSET,
@@ -1010,7 +1128,12 @@ static void xilinx_frmbuf_start_transfer(struct xilinx_frmbuf_chan *chan)
 	/* Start the hardware */
 	xilinx_frmbuf_start(chan);
 	list_del(&desc->node);
-	chan->staged_desc = desc;
+
+	/* No staging descriptor required when auto restart is disabled */
+	if (chan->mode == AUTO_RESTART)
+		chan->staged_desc = desc;
+	else
+		chan->active_desc = desc;
 }
 
 /**
@@ -1061,6 +1184,9 @@ static irqreturn_t xilinx_frmbuf_irq_handler(int irq, void *data)
 {
 	struct xilinx_frmbuf_chan *chan = data;
 	u32 status;
+	dma_async_tx_callback callback = NULL;
+	void *callback_param;
+	struct xilinx_frmbuf_tx_descriptor *desc;
 
 	status = frmbuf_read(chan, XILINX_FRMBUF_ISR_OFFSET);
 	if (!(status & XILINX_FRMBUF_ISR_ALL_IRQ_MASK))
@@ -1069,9 +1195,24 @@ static irqreturn_t xilinx_frmbuf_irq_handler(int irq, void *data)
 	frmbuf_write(chan, XILINX_FRMBUF_ISR_OFFSET,
 		     status & XILINX_FRMBUF_ISR_ALL_IRQ_MASK);
 
+	/* Check if callback function needs to be called early */
+	desc = chan->staged_desc;
+	if (desc && desc->earlycb == EARLY_CALLBACK) {
+		callback = desc->async_tx.callback;
+		callback_param = desc->async_tx.callback_param;
+		if (callback) {
+			callback(callback_param);
+			desc->async_tx.callback = NULL;
+		}
+	}
+
 	if (status & XILINX_FRMBUF_ISR_AP_READY_IRQ) {
 		spin_lock(&chan->lock);
 		chan->idle = true;
+		if (chan->active_desc) {
+			xilinx_frmbuf_complete_descriptor(chan);
+			chan->active_desc = NULL;
+		}
 		xilinx_frmbuf_start_transfer(chan);
 		spin_unlock(&chan->lock);
 	}
@@ -1118,6 +1259,7 @@ xilinx_frmbuf_dma_prep_interleaved(struct dma_chan *dchan,
 	struct xilinx_frmbuf_chan *chan = to_xilinx_chan(dchan);
 	struct xilinx_frmbuf_tx_descriptor *desc;
 	struct xilinx_frmbuf_desc_hw *hw;
+	u32 vsize, hsize;
 
 	if (chan->direction != xt->dir || !chan->vid_fmt)
 		goto error;
@@ -1127,6 +1269,22 @@ xilinx_frmbuf_dma_prep_interleaved(struct dma_chan *dchan,
 
 	if (xt->frame_size != chan->vid_fmt->num_planes)
 		goto error;
+
+	vsize = xt->numf;
+	hsize = (xt->sgl[0].size * chan->vid_fmt->ppw * 8) /
+		 chan->vid_fmt->bpw;
+	/* hsize calc should not have resulted in an odd number */
+	if (hsize & 1)
+		hsize++;
+
+	if (vsize > chan->xdev->max_height || hsize > chan->xdev->max_width) {
+		dev_dbg(chan->xdev->dev,
+			"vsize %d max vsize %d hsize %d max hsize %d\n",
+			vsize, chan->xdev->max_height, hsize,
+			chan->xdev->max_width);
+		dev_err(chan->xdev->dev, "Requested size not supported!\n");
+		goto error;
+	}
 
 	desc = xilinx_frmbuf_alloc_tx_descriptor(chan);
 	if (!desc)
@@ -1265,6 +1423,7 @@ static int xilinx_frmbuf_chan_probe(struct xilinx_frmbuf_device *xdev,
 	chan->dev = xdev->dev;
 	chan->xdev = xdev;
 	chan->idle = true;
+	chan->mode = AUTO_RESTART;
 
 	err = of_property_read_u32(node, "xlnx,dma-addr-width",
 				   &dma_addr_size);
@@ -1346,6 +1505,17 @@ static int xilinx_frmbuf_probe(struct platform_device *pdev)
 
 	dma_dir = (enum dma_transfer_direction)xdev->cfg->direction;
 
+	if (xdev->cfg->flags & XILINX_CLK_PROP) {
+		xdev->ap_clk = devm_clk_get(xdev->dev, "ap_clk");
+		if (IS_ERR(xdev->ap_clk)) {
+			err = PTR_ERR(xdev->ap_clk);
+			dev_err(xdev->dev, "failed to get ap_clk (%d)\n", err);
+			return err;
+		}
+	} else {
+		dev_info(xdev->dev, "assuming clock is enabled!\n");
+	}
+
 	xdev->rst_gpio = devm_gpiod_get(&pdev->dev, "reset",
 					GPIOD_OUT_HIGH);
 	if (IS_ERR(xdev->rst_gpio)) {
@@ -1365,6 +1535,26 @@ static int xilinx_frmbuf_probe(struct platform_device *pdev)
 	xdev->regs = devm_ioremap_resource(&pdev->dev, io);
 	if (IS_ERR(xdev->regs))
 		return PTR_ERR(xdev->regs);
+
+	err = of_property_read_u32(node, "xlnx,max-height", &xdev->max_height);
+	if (err < 0) {
+		dev_err(xdev->dev, "xlnx,max-height is missing!");
+		return -EINVAL;
+	} else if (xdev->max_height > XILINX_FRMBUF_MAX_HEIGHT ||
+		   xdev->max_height < XILINX_FRMBUF_MIN_HEIGHT) {
+		dev_err(&pdev->dev, "Invalid height in dt");
+		return -EINVAL;
+	}
+
+	err = of_property_read_u32(node, "xlnx,max-width", &xdev->max_width);
+	if (err < 0) {
+		dev_err(xdev->dev, "xlnx,max-width is missing!");
+		return -EINVAL;
+	} else if (xdev->max_width > XILINX_FRMBUF_MAX_WIDTH ||
+		   xdev->max_width < XILINX_FRMBUF_MIN_WIDTH) {
+		dev_err(&pdev->dev, "Invalid width in dt");
+		return -EINVAL;
+	}
 
 	/* Initialize the DMA engine */
 	if (xdev->cfg->flags & XILINX_PPC_PROP) {
@@ -1390,6 +1580,15 @@ static int xilinx_frmbuf_probe(struct platform_device *pdev)
 	xdev->common.copy_align = fls(align) - 1;
 	xdev->common.dev = &pdev->dev;
 
+	if (xdev->cfg->flags & XILINX_CLK_PROP) {
+		err = clk_prepare_enable(xdev->ap_clk);
+		if (err) {
+			dev_err(&pdev->dev, " failed to enable ap_clk (%d)\n",
+				err);
+			return err;
+		}
+	}
+
 	INIT_LIST_HEAD(&xdev->common.channels);
 	dma_cap_set(DMA_SLAVE, xdev->common.cap_mask);
 	dma_cap_set(DMA_PRIVATE, xdev->common.cap_mask);
@@ -1397,7 +1596,7 @@ static int xilinx_frmbuf_probe(struct platform_device *pdev)
 	/* Initialize the channels */
 	err = xilinx_frmbuf_chan_probe(xdev, node);
 	if (err < 0)
-		return err;
+		goto disable_clk;
 
 	xdev->chan.direction = dma_dir;
 
@@ -1408,8 +1607,8 @@ static int xilinx_frmbuf_probe(struct platform_device *pdev)
 		xdev->common.directions = BIT(DMA_MEM_TO_DEV);
 		dev_info(&pdev->dev, "Xilinx AXI frmbuf DMA_MEM_TO_DEV\n");
 	} else {
-		xilinx_frmbuf_chan_remove(&xdev->chan);
-		return -EINVAL;
+		err = -EINVAL;
+		goto remove_chan;
 	}
 
 	/* read supported video formats and update internal table */
@@ -1420,7 +1619,7 @@ static int xilinx_frmbuf_probe(struct platform_device *pdev)
 	if (err < 0) {
 		dev_err(&pdev->dev,
 			"Missing or invalid xlnx,vid-formats dts prop\n");
-		return err;
+		goto remove_chan;
 	}
 
 	for (i = 0; i < hw_vid_fmt_cnt; i++) {
@@ -1456,18 +1655,23 @@ static int xilinx_frmbuf_probe(struct platform_device *pdev)
 
 	/* Register the DMA engine with the core */
 	dma_async_device_register(&xdev->common);
-	err = of_dma_controller_register(node, of_dma_xilinx_xlate, xdev);
 
+	err = of_dma_controller_register(node, of_dma_xilinx_xlate, xdev);
 	if (err < 0) {
 		dev_err(&pdev->dev, "Unable to register DMA to DT\n");
-		xilinx_frmbuf_chan_remove(&xdev->chan);
-		dma_async_device_unregister(&xdev->common);
-		return err;
+		goto error;
 	}
 
 	dev_info(&pdev->dev, "Xilinx AXI FrameBuffer Engine Driver Probed!!\n");
 
 	return 0;
+error:
+	dma_async_device_unregister(&xdev->common);
+remove_chan:
+	xilinx_frmbuf_chan_remove(&xdev->chan);
+disable_clk:
+	clk_disable_unprepare(xdev->ap_clk);
+	return err;
 }
 
 /**
@@ -1482,6 +1686,7 @@ static int xilinx_frmbuf_remove(struct platform_device *pdev)
 
 	dma_async_device_unregister(&xdev->common);
 	xilinx_frmbuf_chan_remove(&xdev->chan);
+	clk_disable_unprepare(xdev->ap_clk);
 
 	return 0;
 }

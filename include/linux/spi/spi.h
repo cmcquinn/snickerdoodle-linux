@@ -26,7 +26,7 @@ struct dma_chan;
 struct property_entry;
 struct spi_controller;
 struct spi_transfer;
-struct spi_flash_read_message;
+struct spi_controller_mem_ops;
 
 /*
  * INTERFACES between SPI master-side drivers and SPI slave protocol handlers,
@@ -126,7 +126,8 @@ void spi_statistics_add_transfer_stats(struct spi_statistics *stats,
  *	for that name.  This appears in the sysfs "modalias" attribute
  *	for driver coldplugging, and in uevents used for hotplugging
  * @cs_gpio: gpio number of the chipselect line (optional, -ENOENT when
- *	when not using a GPIO line)
+ *	not using a GPIO line)
+ * @multi_die: Flash device with multiple dies.
  *
  * @statistics: statistics for the spi_device
  *
@@ -163,11 +164,15 @@ struct spi_device {
 #define	SPI_TX_QUAD	0x200			/* transmit with 4 wires */
 #define	SPI_RX_DUAL	0x400			/* receive with 2 wires */
 #define	SPI_RX_QUAD	0x800			/* receive with 4 wires */
+#define	SPI_CS_WORD	0x1000			/* toggle cs after each word */
+#define	SPI_TX_OCTAL	0x2000			/* transmit with 8 wires */
+#define	SPI_RX_OCTAL	0x4000			/* receive with 8 wires */
 	int			irq;
 	void			*controller_state;
 	void			*controller_data;
 	char			modalias[SPI_NAME_SIZE];
 	int			cs_gpio;	/* chip select gpio */
+	bool			multi_die;	/* flash with multiple dies*/
 
 	/* the statistics */
 	struct spi_statistics	statistics;
@@ -177,7 +182,6 @@ struct spi_device {
 	 * the controller talks to each chip, like:
 	 *  - memory packing (12 bit samples into low bits, others zeroed)
 	 *  - priority
-	 *  - drop chipselect after each word
 	 *  - chipselect delays
 	 *  - ...
 	 */
@@ -376,13 +380,11 @@ static inline void spi_unregister_driver(struct spi_driver *sdrv)
  *                    transfer_one callback.
  * @handle_err: the subsystem calls the driver to handle an error that occurs
  *		in the generic implementation of transfer_one_message().
+ * @mem_ops: optimized/dedicated operations for interactions with SPI memory.
+ *	     This field is optional and should only be implemented if the
+ *	     controller has native support for memory like operations.
  * @unprepare_message: undo any work done by prepare_message().
  * @slave_abort: abort the ongoing transfer request on an SPI slave controller
- * @spi_flash_read: to support spi-controller hardwares that provide
- *                  accelerated interface to read from flash devices.
- * @spi_flash_can_dma: analogous to can_dma() interface, but for
- *		       controllers implementing spi_flash_read.
- * @flash_read_supported: spi device supports flash read
  * @cs_gpios: Array of GPIOs to use as chip select lines; one per CS
  *	number. Any individual value may be -ENOENT for CS lines that
  *	are not GPIOs (driven by the SPI controller itself).
@@ -562,11 +564,6 @@ struct spi_controller {
 	int (*unprepare_message)(struct spi_controller *ctlr,
 				 struct spi_message *message);
 	int (*slave_abort)(struct spi_controller *ctlr);
-	int (*spi_flash_read)(struct  spi_device *spi,
-			      struct spi_flash_read_message *msg);
-	bool (*spi_flash_can_dma)(struct spi_device *spi,
-				  struct spi_flash_read_message *msg);
-	bool (*flash_read_supported)(struct spi_device *spi);
 
 	/*
 	 * These hooks are for drivers that use a generic implementation
@@ -577,6 +574,9 @@ struct spi_controller {
 			    struct spi_transfer *transfer);
 	void (*handle_err)(struct spi_controller *ctlr,
 			   struct spi_message *message);
+
+	/* Optimized handlers for SPI memory-like operations. */
+	const struct spi_controller_mem_ops *mem_ops;
 
 	/* gpio chip select */
 	int			*cs_gpios;
@@ -733,6 +733,7 @@ extern void spi_res_release(struct spi_controller *ctlr,
  * @transfer_list: transfers are sequenced through @spi_message.transfers
  * @tx_sg: Scatterlist for transmit, currently not for client use
  * @rx_sg: Scatterlist for receive, currently not for client use
+ * @stripe: true-> enable stripe, false-> disable stripe.
  *
  * SPI transfers always write the same number of bytes as they read.
  * Protocol drivers should always provide @rx_buf and/or @tx_buf.
@@ -813,6 +814,7 @@ struct spi_transfer {
 	u16		delay_usecs;
 	u32		speed_hz;
 	u32		dummy;
+	bool		stripe;
 	struct list_head transfer_list;
 };
 
@@ -1198,48 +1200,6 @@ static inline ssize_t spi_w8r16be(struct spi_device *spi, u8 cmd)
 	return be16_to_cpu(result);
 }
 
-/**
- * struct spi_flash_read_message - flash specific information for
- * spi-masters that provide accelerated flash read interfaces
- * @buf: buffer to read data
- * @from: offset within the flash from where data is to be read
- * @len: length of data to be read
- * @retlen: actual length of data read
- * @read_opcode: read_opcode to be used to communicate with flash
- * @addr_width: number of address bytes
- * @dummy_bytes: number of dummy bytes
- * @opcode_nbits: number of lines to send opcode
- * @addr_nbits: number of lines to send address
- * @data_nbits: number of lines for data
- * @rx_sg: Scatterlist for receive data read from flash
- * @cur_msg_mapped: message has been mapped for DMA
- */
-struct spi_flash_read_message {
-	void *buf;
-	loff_t from;
-	size_t len;
-	size_t retlen;
-	u8 read_opcode;
-	u8 addr_width;
-	u8 dummy_bytes;
-	u8 opcode_nbits;
-	u8 addr_nbits;
-	u8 data_nbits;
-	struct sg_table rx_sg;
-	bool cur_msg_mapped;
-};
-
-/* SPI core interface for flash read support */
-static inline bool spi_flash_read_supported(struct spi_device *spi)
-{
-	return spi->controller->spi_flash_read &&
-	       (!spi->controller->flash_read_supported ||
-	       spi->controller->flash_read_supported(spi));
-}
-
-int spi_flash_read(struct spi_device *spi,
-		   struct spi_flash_read_message *msg);
-
 /*---------------------------------------------------------------------------*/
 
 /*
@@ -1370,6 +1330,8 @@ spi_transfer_is_last(struct spi_controller *ctlr, struct spi_transfer *xfer)
 	return list_is_last(&xfer->transfer_list, &ctlr->cur_msg->transfers);
 }
 
+bool
+update_stripe(const u8 opcode);
 
 /* Compatibility layer */
 #define spi_master			spi_controller

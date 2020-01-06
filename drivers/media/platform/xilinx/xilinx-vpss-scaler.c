@@ -13,6 +13,7 @@
  * GNU General Public License for more details.
  */
 
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
@@ -24,10 +25,10 @@
 #include <media/v4l2-subdev.h>
 #include "xilinx-vip.h"
 
-#define XSCALER_MIN_WIDTH		(32)
-#define XSCALER_MAX_WIDTH		(3840)
-#define XSCALER_MIN_HEIGHT		(32)
-#define XSCALER_MAX_HEIGHT		(2160)
+#define XSCALER_MIN_WIDTH		(64)
+#define XSCALER_MAX_WIDTH		(8192)
+#define XSCALER_MIN_HEIGHT		(64)
+#define XSCALER_MAX_HEIGHT		(4320)
 #define XSCALER_MAX_PHASES		(64)
 
 /* Modify to defaults incase it is not configured from application */
@@ -86,6 +87,7 @@ enum xscaler_vid_reg_fmts {
 /* Video IP PPC */
 #define XSCALER_PPC_1			(1)
 #define XSCALER_PPC_2			(2)
+#define XSCALER_PPC_4			(4)
 
 #define XV_HSCALER_MAX_H_TAPS           (12)
 #define XV_HSCALER_MAX_H_PHASES         (64)
@@ -113,6 +115,7 @@ enum xscaler_vid_reg_fmts {
 #define XHSC_STEP_PRECISION_SHIFT	(16)
 #define XHSC_HPHASE_SHIFT_BY_6		(6)
 #define XHSC_HPHASE_MULTIPLIER		(9)
+#define XHSC_HPHASE_MUL_4PPC		(10)
 
 /* Mask definitions for Low and high 16 bits in a 32 bit number */
 #define XVSC_MASK_LOW_16BITS            GENMASK(15, 0)
@@ -420,6 +423,7 @@ xhsc_coeff_taps12[XV_HSCALER_MAX_H_PHASES][XV_HSCALER_TAPS_12] = {
 #define XV_HSCALER_CTRL_ADDR_HWREG_PHASESH_V_HIGH		(0x3fff)
 #define XV_HSCALER_CTRL_WIDTH_HWREG_PHASESH_V			(18)
 #define XV_HSCALER_CTRL_DEPTH_HWREG_PHASESH_V			(1920)
+#define XV_HSCALER_CTRL_ADDR_HWREG_PHASEH_FIX			(0x4000)
 
 /* H-scaler masks */
 #define XV_HSCALER_PHASESH_V_OUTPUT_WR_EN			BIT(8)
@@ -713,6 +717,18 @@ xvsc_coeff_taps12[XV_VSCALER_MAX_V_PHASES][XV_VSCALER_TAPS_12] = {
 #define XV_VSCALER_CTRL_WIDTH_HWREG_VFLTCOEFF		(16)
 #define XV_VSCALER_CTRL_DEPTH_HWREG_VFLTCOEFF		(384)
 
+/* These bits are for xscaler feature flags */
+#define XSCALER_CLK_PROP	BIT(0)
+#define XSCALER_HPHASE_FIX	BIT(1)
+
+/**
+ * struct xscaler_feature - dt or IP property structure
+ * @flags: Bitmask of properties enabled in IP or dt
+ */
+struct xscaler_feature {
+	u32 flags;
+};
+
 /**
  * struct xscaler_device - Xilinx Scaler device structure
  * @xvip: Xilinx Video IP device
@@ -731,6 +747,9 @@ xvsc_coeff_taps12[XV_VSCALER_MAX_V_PHASES][XV_VSCALER_TAPS_12] = {
  * @vscaler_coeff: The complete array of V-scaler coefficients
  * @is_polyphase: Track if scaling algorithm is polyphase or not
  * @rst_gpio: GPIO reset line to bring VPSS Scaler out of reset
+ * @cfg: Pointer to scaler config structure
+ * @aclk_axis: AXI4-Stream video interface clock
+ * @aclk_ctrl: AXI4-Lite control interface clock
  */
 struct xscaler_device {
 	struct xvip_device xvip;
@@ -746,13 +765,39 @@ struct xscaler_device {
 	u32 pix_per_clk;
 	u32 max_pixels;
 	u32 max_lines;
-	u32 H_phases[XV_HSCALER_MAX_LINE_WIDTH];
+	u64 H_phases[XV_HSCALER_MAX_LINE_WIDTH];
 	short hscaler_coeff[XV_HSCALER_MAX_H_PHASES][XV_HSCALER_MAX_H_TAPS];
 	short vscaler_coeff[XV_VSCALER_MAX_V_PHASES][XV_VSCALER_MAX_V_TAPS];
 	bool is_polyphase;
 
 	struct gpio_desc *rst_gpio;
+	const struct xscaler_feature *cfg;
+	struct clk *aclk_axis;
+	struct clk *aclk_ctrl;
 };
+
+static const struct xscaler_feature xlnx_scaler_v2_2 = {
+	.flags = XSCALER_CLK_PROP | XSCALER_HPHASE_FIX,
+};
+
+static const struct xscaler_feature xlnx_scaler_v1_0 = {
+	.flags = XSCALER_CLK_PROP,
+};
+
+static const struct xscaler_feature xlnx_scaler = {
+	.flags = 0,
+};
+
+static const struct of_device_id xscaler_of_id_table[] = {
+	{ .compatible = "xlnx,v-vpss-scaler",
+		.data = &xlnx_scaler},
+	{ .compatible = "xlnx,v-vpss-scaler-1.0",
+		.data = &xlnx_scaler_v1_0},
+	{ .compatible = "xlnx,v-vpss-scaler-2.2",
+		.data = &xlnx_scaler_v2_2},
+	{ /* end of table */ }
+};
+MODULE_DEVICE_TABLE(of, xscaler_of_id_table);
 
 static inline struct xscaler_device *to_scaler(struct v4l2_subdev *subdev)
 {
@@ -770,7 +815,7 @@ xv_hscaler_calculate_phases(struct xscaler_device *xscaler,
 	bool output_write_en;
 	bool get_new_pix;
 	u64 phaseH;
-	u32 array_idx = 0;
+	u64 array_idx = 0;
 	int nr_rds;
 	int nr_rds_clck;
 	unsigned int nphases = xscaler->max_num_phases;
@@ -801,16 +846,32 @@ xv_hscaler_calculate_phases(struct xscaler_device *xscaler,
 				xwrite_pos++;
 			}
 
-			/* Needs updates for 4 PPC */
-			xscaler->H_phases[x] |= (phaseH <<
-						(s * XHSC_HPHASE_MULTIPLIER));
-			xscaler->H_phases[x] |= (array_idx <<
-						(XHSC_HPHASE_SHIFT_BY_6 +
-						(s * XHSC_HPHASE_MULTIPLIER)));
-			if (output_write_en) {
+			if (nppc == XSCALER_PPC_4) {
 				xscaler->H_phases[x] |=
-				(XV_HSCALER_PHASESH_V_OUTPUT_WR_EN <<
-				(s * XHSC_HPHASE_MULTIPLIER));
+					((u64)phaseH <<
+					 (s * XHSC_HPHASE_MUL_4PPC));
+				xscaler->H_phases[x] |=
+					((u64)array_idx <<
+					 (XHSC_HPHASE_SHIFT_BY_6 +
+					  (s * XHSC_HPHASE_MUL_4PPC)));
+				if (output_write_en)
+					xscaler->H_phases[x] |=
+						((u64)1 <<
+						 (XHSC_HPHASE_MULTIPLIER + s *
+						  XHSC_HPHASE_MUL_4PPC));
+			} else {
+				xscaler->H_phases[x] |=
+					(phaseH <<
+					 (s * XHSC_HPHASE_MULTIPLIER));
+				xscaler->H_phases[x] |=
+					(array_idx <<
+					 (XHSC_HPHASE_SHIFT_BY_6 +
+					  (s * XHSC_HPHASE_MULTIPLIER)));
+
+				if (output_write_en)
+					xscaler->H_phases[x] |=
+						(XV_HSCALER_PHASESH_V_OUTPUT_WR_EN <<
+						 (s * XHSC_HPHASE_MULTIPLIER));
 			}
 
 			if (get_new_pix)
@@ -1002,10 +1063,11 @@ xv_vscaler_load_ext_coeff(struct xscaler_device *xscaler,
 			/* pad left */
 			for (j = 0; j < offset; j++)
 				xscaler->vscaler_coeff[i][j] = 0;
+			/* pad right */
+			j = ntaps + offset;
+			for (; j < XV_VSCALER_MAX_V_TAPS; j++)
+				xscaler->vscaler_coeff[i][j] = 0;
 		}
-		/* pad right */
-		for (j = (ntaps + offset); j < XV_VSCALER_MAX_V_TAPS; j++)
-			xscaler->vscaler_coeff[i][j] = 0;
 	}
 }
 
@@ -1163,21 +1225,25 @@ xv_vscaler_setup_video_fmt(struct xscaler_device *xscaler, u32 code_in)
 
 	switch (code_in) {
 	case MEDIA_BUS_FMT_VYYUYY8_1X24:
+	case MEDIA_BUS_FMT_VYYUYY10_4X20:
 		dev_dbg(xscaler->xvip.dev,
 			"Vscaler Input Media Format YUV 420");
 		video_in = XVIDC_CSF_YCRCB_420;
 		break;
 	case MEDIA_BUS_FMT_UYVY8_1X16:
+	case MEDIA_BUS_FMT_UYVY10_1X20:
 		dev_dbg(xscaler->xvip.dev,
 			"Vscaler Input Media Format YUV 422");
 		video_in = XVIDC_CSF_YCRCB_422;
 		break;
 	case MEDIA_BUS_FMT_VUY8_1X24:
+	case MEDIA_BUS_FMT_VUY10_1X30:
 		dev_dbg(xscaler->xvip.dev,
 			"Vscaler Input Media Format YUV 444");
 		video_in = XVIDC_CSF_YCRCB_444;
 		break;
 	case MEDIA_BUS_FMT_RBG888_1X24:
+	case MEDIA_BUS_FMT_RBG101010_1X30:
 		dev_dbg(xscaler->xvip.dev,
 			"Vscaler Input Media Format RGB");
 		video_in = XVIDC_CSF_RGB;
@@ -1230,21 +1296,25 @@ static int xv_hscaler_setup_video_fmt(struct xscaler_device *xscaler,
 
 	switch (code_out) {
 	case MEDIA_BUS_FMT_VYYUYY8_1X24:
+	case MEDIA_BUS_FMT_VYYUYY10_4X20:
 		dev_dbg(xscaler->xvip.dev,
 			"Hscaler Output Media Format YUV 420\n");
 		video_out = XVIDC_CSF_YCRCB_420;
 		break;
 	case MEDIA_BUS_FMT_UYVY8_1X16:
+	case MEDIA_BUS_FMT_UYVY10_1X20:
 		dev_dbg(xscaler->xvip.dev,
 			"Hscaler Output Media Format YUV 422\n");
 		video_out = XVIDC_CSF_YCRCB_422;
 		break;
 	case MEDIA_BUS_FMT_VUY8_1X24:
+	case MEDIA_BUS_FMT_VUY10_1X30:
 		dev_dbg(xscaler->xvip.dev,
 			"Hscaler Output Media Format YUV 444\n");
 		video_out = XVIDC_CSF_YCRCB_444;
 		break;
 	case MEDIA_BUS_FMT_RBG888_1X24:
+	case MEDIA_BUS_FMT_RBG101010_1X30:
 		dev_dbg(xscaler->xvip.dev,
 			"Hscaler Output Media Format RGB\n");
 		video_out = XVIDC_CSF_RGB;
@@ -1265,11 +1335,19 @@ static void
 xv_hscaler_set_phases(struct xscaler_device *xscaler)
 {
 	u32 loop_width;
-	u32 index, val;
-	u32 offset, i, lsb, msb;
+	u32 index = 0, val;
+	u32 offset, i, j = 0, lsb, msb;
+	u64 phasehdata;
 
 	loop_width = xscaler->max_pixels / xscaler->pix_per_clk;
-	offset = V_HSCALER_OFF + XV_HSCALER_CTRL_ADDR_HWREG_PHASESH_V_BASE;
+
+	if (xscaler->cfg->flags & XSCALER_HPHASE_FIX) {
+		offset = V_HSCALER_OFF +
+			XV_HSCALER_CTRL_ADDR_HWREG_PHASEH_FIX;
+	} else {
+		offset = V_HSCALER_OFF +
+			XV_HSCALER_CTRL_ADDR_HWREG_PHASESH_V_BASE;
+	}
 
 	switch (xscaler->pix_per_clk) {
 	case XSCALER_PPC_1:
@@ -1280,10 +1358,11 @@ xv_hscaler_set_phases(struct xscaler_device *xscaler)
 		 * into IP registers (i is array loc and index is
 		 * address offset)
 		 */
-		index = 0;
 		for (i = 0; i < loop_width; i += 2) {
-			lsb = xscaler->H_phases[i] & XHSC_MASK_LOW_16BITS;
-			msb = xscaler->H_phases[i + 1] & XHSC_MASK_LOW_16BITS;
+			lsb = lower_32_bits(xscaler->H_phases[i] &
+					    XHSC_MASK_LOW_16BITS);
+			msb = lower_32_bits(xscaler->H_phases[i + 1] &
+					    XHSC_MASK_LOW_16BITS);
 			val = (msb << 16 | lsb);
 			xvip_write(&xscaler->xvip, offset + (index * 4), val);
 			++index;
@@ -1297,13 +1376,34 @@ xv_hscaler_set_phases(struct xscaler_device *xscaler)
 		 * Need 1 32b write to get each entry into IP registers
 		 */
 		for (i = 0; i < loop_width; i++) {
-			val = (xscaler->H_phases[i] &
-					XHSC_MASK_LOW_32BITS);
+			val = lower_32_bits(xscaler->H_phases[i] &
+					    XHSC_MASK_LOW_32BITS);
 			xvip_write(&xscaler->xvip, offset + (i * 4), val);
 		}
 		dev_dbg(xscaler->xvip.dev,
 			"%s : Operating in 2 PPC design", __func__);
 		return;
+	case XSCALER_PPC_4:
+		/*
+		 * PhaseH is 64bits and each entry has valid 32b MSB & LSB
+		 * Need 2 32b writes to get each entry into IP registers
+		 * (index is array loc and offset is address offset)
+		 */
+		for (i = 0; i < loop_width; i++) {
+			phasehdata = xscaler->H_phases[index++];
+			lsb = (u32)(phasehdata & XHSC_MASK_LOW_32BITS);
+			msb = (u32)((phasehdata >> 32) & XHSC_MASK_LOW_32BITS);
+			xvip_write(&xscaler->xvip, offset + (j * 4), lsb);
+			xvip_write(&xscaler->xvip, offset + ((j + 1) * 4), msb);
+			j += 2;
+		}
+		dev_dbg(xscaler->xvip.dev,
+			"%s : Operating in 4 PPC design", __func__);
+		return;
+	default:
+		dev_warn(xscaler->xvip.dev, "%s : %d unsupported ppc design!!!\n",
+			 __func__, xscaler->pix_per_clk);
+
 	}
 }
 
@@ -1410,15 +1510,16 @@ static int xscaler_enum_frame_size(struct v4l2_subdev *subdev,
 				   struct v4l2_subdev_frame_size_enum *fse)
 {
 	struct v4l2_mbus_framefmt *format;
+	struct xscaler_device *xscaler = to_scaler(subdev);
 
 	format = v4l2_subdev_get_try_format(subdev, cfg, fse->pad);
 	if (fse->index || fse->code != format->code)
 		return -EINVAL;
 
 	fse->min_width = XSCALER_MIN_WIDTH;
-	fse->max_width = XSCALER_MAX_WIDTH;
+	fse->max_width = xscaler->max_pixels;
 	fse->min_height = XSCALER_MIN_HEIGHT;
-	fse->max_height = XSCALER_MAX_HEIGHT;
+	fse->max_height = xscaler->max_lines;
 
 	return 0;
 }
@@ -1462,9 +1563,10 @@ static int xscaler_set_format(struct v4l2_subdev *subdev,
 	*format = fmt->format;
 
 	format->width = clamp_t(unsigned int, fmt->format.width,
-				XSCALER_MIN_WIDTH, XSCALER_MAX_WIDTH);
+				XSCALER_MIN_WIDTH, xscaler->max_pixels);
 	format->height = clamp_t(unsigned int, fmt->format.height,
-				XSCALER_MIN_HEIGHT, XSCALER_MAX_HEIGHT);
+				 XSCALER_MIN_HEIGHT, xscaler->max_lines);
+	format->code = fmt->format.code;
 	fmt->format = *format;
 	return 0;
 }
@@ -1537,6 +1639,45 @@ static int xscaler_parse_of(struct xscaler_device *xscaler)
 	struct device_node *port;
 	int ret;
 	u32 port_id, dt_ppc;
+
+	if (xscaler->cfg->flags & XSCALER_CLK_PROP) {
+		xscaler->aclk_axis = devm_clk_get(dev, "aclk_axis");
+		if (IS_ERR(xscaler->aclk_axis)) {
+			ret = PTR_ERR(xscaler->aclk_axis);
+			dev_err(dev, "failed to get aclk_axis (%d)\n", ret);
+			return ret;
+		}
+		xscaler->aclk_ctrl = devm_clk_get(dev, "aclk_ctrl");
+		if (IS_ERR(xscaler->aclk_ctrl)) {
+			ret = PTR_ERR(xscaler->aclk_ctrl);
+			dev_err(dev, "failed to get aclk_ctrl (%d)\n", ret);
+			return ret;
+		}
+	} else {
+		dev_info(dev, "assuming all required clocks are enabled!\n");
+	}
+
+	ret = of_property_read_u32(node, "xlnx,max-height",
+				   &xscaler->max_lines);
+	if (ret < 0) {
+		dev_err(dev, "xlnx,max-height is missing!");
+		return -EINVAL;
+	} else if (xscaler->max_lines > XSCALER_MAX_HEIGHT ||
+		   xscaler->max_lines < XSCALER_MIN_HEIGHT) {
+		dev_err(dev, "Invalid height in dt");
+		return -EINVAL;
+	}
+
+	ret = of_property_read_u32(node, "xlnx,max-width",
+				   &xscaler->max_pixels);
+	if (ret < 0) {
+		dev_err(dev, "xlnx,max-width is missing!");
+		return -EINVAL;
+	} else if (xscaler->max_pixels > XSCALER_MAX_WIDTH ||
+		   xscaler->max_pixels < XSCALER_MIN_WIDTH) {
+		dev_err(dev, "Invalid width in dt");
+		return -EINVAL;
+	}
 
 	ports = of_get_child_by_name(node, "ports");
 	if (!ports)
@@ -1624,7 +1765,8 @@ static int xscaler_parse_of(struct xscaler_device *xscaler)
 		return ret;
 
 	/* Driver only supports 1 PPC and 2 PPC */
-	if (dt_ppc != XSCALER_PPC_1 && dt_ppc != XSCALER_PPC_2) {
+	if (dt_ppc != XSCALER_PPC_1 && dt_ppc != XSCALER_PPC_2 &&
+	    dt_ppc != XSCALER_PPC_4) {
 		dev_err(xscaler->xvip.dev,
 			"Unsupported xlnx,pix-per-clk(%d) value in DT", dt_ppc);
 		return -EINVAL;
@@ -1648,6 +1790,9 @@ static int xscaler_probe(struct platform_device *pdev)
 	struct v4l2_subdev *subdev;
 	struct v4l2_mbus_framefmt *default_format;
 	int ret;
+	const struct of_device_id *match;
+	struct device_node *node = pdev->dev.of_node;
+	struct resource *res;
 
 	xscaler = devm_kzalloc(&pdev->dev, sizeof(*xscaler), GFP_KERNEL);
 	if (!xscaler)
@@ -1655,18 +1800,51 @@ static int xscaler_probe(struct platform_device *pdev)
 
 	xscaler->xvip.dev = &pdev->dev;
 
+	match = of_match_node(xscaler_of_id_table, node);
+	if (!match)
+		return -ENODEV;
+
+	if (!strncmp(match->compatible, xscaler_of_id_table[0].compatible,
+		     strlen(xscaler_of_id_table[0].compatible))) {
+		dev_warn(&pdev->dev,
+			 "%s - compatible string is getting deprecated!\n",
+			 match->compatible);
+	}
+
+	xscaler->cfg = match->data;
+
 	ret = xscaler_parse_of(xscaler);
 	if (ret < 0)
 		return ret;
 
 	/* Initialize coefficient parameters */
 	xscaler->max_num_phases = XSCALER_MAX_PHASES;
-	xscaler->max_lines = XSCALER_MAX_HEIGHT;
-	xscaler->max_pixels = XSCALER_MAX_WIDTH;
 
-	ret = xvip_init_resources(&xscaler->xvip);
-	if (ret < 0)
-		return ret;
+	if (xscaler->cfg->flags & XSCALER_CLK_PROP) {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		xscaler->xvip.iomem = devm_ioremap_resource(xscaler->xvip.dev,
+							    res);
+		if (IS_ERR(xscaler->xvip.iomem))
+			return PTR_ERR(xscaler->xvip.iomem);
+
+		ret = clk_prepare_enable(xscaler->aclk_axis);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to enable aclk_axis (%d)\n",
+				ret);
+			goto res_cleanup;
+		}
+
+		ret = clk_prepare_enable(xscaler->aclk_ctrl);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to enable aclk_ctrl (%d)\n",
+				ret);
+			goto axis_clk_cleanup;
+		}
+	} else {
+		ret = xvip_init_resources(&xscaler->xvip);
+		if (ret < 0)
+			return ret;
+	}
 
 	/* Reset the Global IP Reset through a PS GPIO */
 	gpiod_set_value_cansleep(xscaler->rst_gpio, XSCALER_RESET_DEASSERT);
@@ -1722,6 +1900,10 @@ static int xscaler_probe(struct platform_device *pdev)
 
 error:
 	media_entity_cleanup(&subdev->entity);
+	clk_disable_unprepare(xscaler->aclk_ctrl);
+axis_clk_cleanup:
+	clk_disable_unprepare(xscaler->aclk_axis);
+res_cleanup:
 	xvip_cleanup_resources(&xscaler->xvip);
 	return ret;
 }
@@ -1733,16 +1915,12 @@ static int xscaler_remove(struct platform_device *pdev)
 
 	v4l2_async_unregister_subdev(subdev);
 	media_entity_cleanup(&subdev->entity);
+	clk_disable_unprepare(xscaler->aclk_ctrl);
+	clk_disable_unprepare(xscaler->aclk_axis);
 	xvip_cleanup_resources(&xscaler->xvip);
 
 	return 0;
 }
-
-static const struct of_device_id xscaler_of_id_table[] = {
-	{ .compatible = "xlnx,v-vpss-scaler" },
-	{ /* end of table */ }
-};
-MODULE_DEVICE_TABLE(of, xscaler_of_id_table);
 
 static struct platform_driver xscaler_driver = {
 	.driver			= {

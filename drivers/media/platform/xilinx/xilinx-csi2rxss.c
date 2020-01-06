@@ -17,9 +17,11 @@
 
 #include <dt-bindings/media/xilinx-vip.h>
 #include <linux/bitops.h>
+#include <linux/clk.h>
 #include <linux/compiler.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -79,6 +81,7 @@
 
 #define XCSI_ISR_OFFSET			0x00000024
 #define XCSI_ISR_FR_SHIFT		31
+#define XCSI_ISR_VCX_SHIFT		30
 #define XCSI_ISR_ILC_SHIFT		21
 #define XCSI_ISR_SPFIFOF_SHIFT		20
 #define XCSI_ISR_SPFIFONE_SHIFT		19
@@ -99,6 +102,7 @@
 #define XCSI_ISR_VC0FSYNCERR_SHIFT	1
 #define XCSI_ISR_VC0FLVLERR_SHIFT	0
 #define XCSI_ISR_FR_MASK		BIT(XCSI_ISR_FR_SHIFT)
+#define XCSI_ISR_VCX_MASK		BIT(XCSI_ISR_VCX_SHIFT)
 #define XCSI_ISR_ILC_MASK		BIT(XCSI_ISR_ILC_SHIFT)
 #define XCSI_ISR_SPFIFOF_MASK		BIT(XCSI_ISR_SPFIFOF_SHIFT)
 #define XCSI_ISR_SPFIFONE_MASK		BIT(XCSI_ISR_SPFIFONE_SHIFT)
@@ -118,7 +122,7 @@
 #define XCSI_ISR_VC1FLVLERR_MASK	BIT(XCSI_ISR_VC1FLVLERR_SHIFT)
 #define XCSI_ISR_VC0FSYNCERR_MASK	BIT(XCSI_ISR_VC0FSYNCERR_SHIFT)
 #define XCSI_ISR_VC0FLVLERR_MASK	BIT(XCSI_ISR_VC0FLVLERR_SHIFT)
-#define XCSI_ISR_ALLINTR_MASK		0x803FFFFF
+#define XCSI_ISR_ALLINTR_MASK		0xC03FFFFF
 
 #define XCSI_INTR_PROT_MASK	(XCSI_ISR_VC3FSYNCERR_MASK |	\
 				 XCSI_ISR_VC3FLVLERR_MASK |	\
@@ -127,7 +131,8 @@
 				 XCSI_ISR_VC1FSYNCERR_MASK |	\
 				 XCSI_ISR_VC1FLVLERR_MASK |	\
 				 XCSI_ISR_VC0FSYNCERR_MASK |	\
-				 XCSI_ISR_VC0FLVLERR_MASK)
+				 XCSI_ISR_VC0FLVLERR_MASK |	\
+				 XCSI_ISR_VCX_MASK)
 
 #define XCSI_INTR_PKTLVL_MASK	(XCSI_ISR_ECC2BERR_MASK |	\
 				 XCSI_ISR_ECC1BERR_MASK |	\
@@ -148,6 +153,7 @@
 
 #define XCSI_IER_OFFSET			0x00000028
 #define XCSI_IER_FR_SHIFT		31
+#define XCSI_IER_VCX_SHIFT		30
 #define XCSI_IER_ILC_SHIFT		21
 #define XCSI_IER_SPFIFOF_SHIFT		20
 #define XCSI_IER_SPFIFONE_SHIFT		19
@@ -168,6 +174,7 @@
 #define XCSI_IER_VC0FSYNCERR_SHIFT	1
 #define XCSI_IER_VC0FLVLERR_SHIFT	0
 #define XCSI_IER_FR_MASK		BIT(XCSI_IER_FR_SHIFT)
+#define XCSI_IER_VCX_MASK		BIT(XCSI_IER_VCX_SHIFT)
 #define XCSI_IER_ILC_MASK		BIT(XCSI_IER_ILC_SHIFT)
 #define XCSI_IER_SPFIFOF_MASK		BIT(XCSI_IER_SPFIFOF_SHIFT)
 #define XCSI_IER_SPFIFONE_MASK		BIT(XCSI_IER_SPFIFONE_SHIFT)
@@ -187,7 +194,7 @@
 #define XCSI_IER_VC1FLVLERR_MASK	BIT(XCSI_IER_VC1FLVLERR_SHIFT)
 #define XCSI_IER_VC0FSYNCERR_MASK	BIT(XCSI_IER_VC0FSYNCERR_SHIFT)
 #define XCSI_IER_VC0FLVLERR_MASK	BIT(XCSI_IER_VC0FLVLERR_SHIFT)
-#define XCSI_IER_ALLINTR_MASK		0x803FFFFF
+#define XCSI_IER_ALLINTR_MASK		0xC03FFFFF
 
 #define XCSI_SPKTR_OFFSET		0x00000030
 #define XCSI_SPKTR_DATA_SHIFT		8
@@ -196,6 +203,33 @@
 #define XCSI_SPKTR_DATA_MASK		0x00FFFF00
 #define XCSI_SPKTR_VC_MASK		0x000000C0
 #define XCSI_SPKTR_DT_MASK		0x0000003F
+
+#define XCSI_VCXR_OFFSET		0x00000034
+#define XCSI_VCXR_VC15FSYNCERR_MASK	BIT(23)
+#define XCSI_VCXR_VC15FLVLERR_MASK	BIT(22)
+#define XCSI_VCXR_VC14FSYNCERR_MASK	BIT(21)
+#define XCSI_VCXR_VC14FLVLERR_MASK	BIT(20)
+#define XCSI_VCXR_VC13FSYNCERR_MASK	BIT(19)
+#define XCSI_VCXR_VC13FLVLERR_MASK	BIT(18)
+#define XCSI_VCXR_VC12FSYNCERR_MASK	BIT(17)
+#define XCSI_VCXR_VC12FLVLERR_MASK	BIT(16)
+#define XCSI_VCXR_VC11FSYNCERR_MASK	BIT(15)
+#define XCSI_VCXR_VC11FLVLERR_MASK	BIT(14)
+#define XCSI_VCXR_VC10FSYNCERR_MASK	BIT(13)
+#define XCSI_VCXR_VC10FLVLERR_MASK	BIT(12)
+#define XCSI_VCXR_VC9FSYNCERR_MASK	BIT(11)
+#define XCSI_VCXR_VC9FLVLERR_MASK	BIT(10)
+#define XCSI_VCXR_VC8FSYNCERR_MASK	BIT(9)
+#define XCSI_VCXR_VC8FLVLERR_MASK	BIT(8)
+#define XCSI_VCXR_VC7FSYNCERR_MASK	BIT(7)
+#define XCSI_VCXR_VC7FLVLERR_MASK	BIT(6)
+#define XCSI_VCXR_VC6FSYNCERR_MASK	BIT(5)
+#define XCSI_VCXR_VC6FLVLERR_MASK	BIT(4)
+#define XCSI_VCXR_VC5FSYNCERR_MASK	BIT(3)
+#define XCSI_VCXR_VC5FLVLERR_MASK	BIT(2)
+#define XCSI_VCXR_VC4FSYNCERR_MASK	BIT(1)
+#define XCSI_VCXR_VC4FLVLERR_MASK	BIT(0)
+#define XCSI_VCXR_MASK			0x00FFFFFF
 
 #define XCSI_CLKINFR_OFFSET		0x0000003C
 #define XCSI_CLKINFR_STOP_SHIFT		1
@@ -216,6 +250,18 @@
 #define XCSI_VC1INF1R_OFFSET		0x00000068
 #define XCSI_VC2INF1R_OFFSET		0x00000070
 #define XCSI_VC3INF1R_OFFSET		0x00000078
+#define XCSI_VC4INF1R_OFFSET		0x00000080
+#define XCSI_VC5INF1R_OFFSET		0x00000088
+#define XCSI_VC6INF1R_OFFSET		0x00000090
+#define XCSI_VC7INF1R_OFFSET		0x00000098
+#define XCSI_VC8INF1R_OFFSET		0x000000A0
+#define XCSI_VC9INF1R_OFFSET		0x000000A8
+#define XCSI_VC10INF1R_OFFSET		0x000000B0
+#define XCSI_VC11INF1R_OFFSET		0x000000B8
+#define XCSI_VC12INF1R_OFFSET		0x000000C0
+#define XCSI_VC13INF1R_OFFSET		0x000000C8
+#define XCSI_VC14INF1R_OFFSET		0x000000D0
+#define XCSI_VC15INF1R_OFFSET		0x000000D8
 #define XCSI_VCXINF1R_LINECOUNT_SHIFT	16
 #define XCSI_VCXINF1R_BYTECOUNT_SHIFT	0
 #define XCSI_VCXINF1R_LINECOUNT_MASK	0xFFFF0000
@@ -225,6 +271,18 @@
 #define XCSI_VC1INF2R_OFFSET		0x0000006C
 #define XCSI_VC2INF2R_OFFSET		0x00000074
 #define XCSI_VC3INF2R_OFFSET		0x0000007C
+#define XCSI_VC4INF2R_OFFSET		0x00000084
+#define XCSI_VC5INF2R_OFFSET		0x0000008C
+#define XCSI_VC6INF2R_OFFSET		0x00000094
+#define XCSI_VC7INF2R_OFFSET		0x0000009C
+#define XCSI_VC8INF2R_OFFSET		0x000000A4
+#define XCSI_VC9INF2R_OFFSET		0x000000AC
+#define XCSI_VC10INF2R_OFFSET		0x000000B4
+#define XCSI_VC11INF2R_OFFSET		0x000000BC
+#define XCSI_VC12INF2R_OFFSET		0x000000C4
+#define XCSI_VC13INF2R_OFFSET		0x000000CC
+#define XCSI_VC14INF2R_OFFSET		0x000000D4
+#define XCSI_VC15INF2R_OFFSET		0x000000DC
 #define XCSI_VCXINF2R_DATATYPE_SHIFT	0
 #define XCSI_VCXINF2R_DATATYPE_MASK	0x0000003F
 
@@ -264,10 +322,24 @@
 #define XCSI_DEFAULT_WIDTH	(1920)
 #define XCSI_DEFAULT_HEIGHT	(1080)
 
+#define XCSI_DPHY_CLK_MIN	197000000000UL
+#define XCSI_DPHY_CLK_MAX	203000000000UL
+#define XCSI_DPHY_CLK_REQ	200000000000UL
+
 /*
  * Macro to return "true" or "false" string if bit is set
  */
 #define XCSI_GET_BITSET_STR(val, mask)	(val) & (mask) ? "true" : "false"
+
+#define XCSI_CLK_PROP		BIT(0)
+
+/**
+ * struct xcsi2rxss_feature - dt or IP property structure
+ * @flags: Bitmask of properties enabled in IP or dt
+ */
+struct xcsi2rxss_feature {
+	u32 flags;
+};
 
 enum CSI_DataTypes {
 	MIPI_CSI_DT_FRAME_START_CODE = 0x00,
@@ -316,8 +388,8 @@ enum CSI_DataTypes {
 	MIPI_CSI_DT_RAW_10,
 	MIPI_CSI_DT_RAW_12,
 	MIPI_CSI_DT_RAW_14,
-	MIPI_CSI_DT_RAW_RSVD_2E,
-	MIPI_CSI_DT_RAW_RSVD_2F,
+	MIPI_CSI_DT_RAW_16,
+	MIPI_CSI_DT_RAW_20,
 	MIPI_CSI_DT_USER_30,
 	MIPI_CSI_DT_USER_31,
 	MIPI_CSI_DT_USER_32,
@@ -375,6 +447,13 @@ struct xcsi2rxss_event {
  * @pxlformat: String with CSI pixel format from IP
  * @num_lanes: Number of lanes requested from application
  * @events: Structure to maintain event logs
+ * @vcx_events: Structure to maintain VCX event logs
+ * @en_vcx: If more than 4 VC are enabled.
+ * @cfg: Pointer to csi2rxss config structure
+ * @lite_aclk: AXI4-Lite interface clock
+ * @video_aclk: Video clock
+ * @dphy_clk_200M: 200MHz DPHY clock
+ * @rst_gpio: video_aresetn
  */
 struct xcsi2rxss_core {
 	struct device *dev;
@@ -392,6 +471,13 @@ struct xcsi2rxss_core {
 	const char *pxlformat;
 	u32 num_lanes;
 	struct xcsi2rxss_event *events;
+	struct xcsi2rxss_event *vcx_events;
+	bool en_vcx;
+	const struct xcsi2rxss_feature *cfg;
+	struct clk *lite_aclk;
+	struct clk *video_aclk;
+	struct clk *dphy_clk_200M;
+	struct gpio_desc *rst_gpio;
 };
 
 /**
@@ -415,7 +501,7 @@ struct xcsi2rxss_state {
 	struct xcsi2rxss_core core;
 	struct v4l2_subdev subdev;
 	struct v4l2_ctrl_handler ctrl_handler;
-	struct v4l2_mbus_framefmt formats[2];
+	struct v4l2_mbus_framefmt formats;
 	struct v4l2_mbus_framefmt default_format;
 	const struct xvip_video_format *vip_format;
 	struct v4l2_event event;
@@ -425,6 +511,25 @@ struct xcsi2rxss_state {
 	bool streaming;
 	bool suspended;
 };
+
+static const struct xcsi2rxss_feature xlnx_csi2rxss_v4_0 = {
+	.flags = XCSI_CLK_PROP,
+};
+
+static const struct xcsi2rxss_feature xlnx_csi2rxss_v2_0 = {
+	.flags = 0,
+};
+
+static const struct of_device_id xcsi2rxss_of_id_table[] = {
+	{ .compatible = "xlnx,mipi-csi2-rx-subsystem-2.0",
+		.data = &xlnx_csi2rxss_v2_0 },
+	{ .compatible = "xlnx,mipi-csi2-rx-subsystem-3.0",
+		.data = &xlnx_csi2rxss_v2_0 },
+	{ .compatible = "xlnx,mipi-csi2-rx-subsystem-4.0",
+		.data = &xlnx_csi2rxss_v4_0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, xcsi2rxss_of_id_table);
 
 static inline struct xcsi2rxss_state *
 to_xcsi2rxssstate(struct v4l2_subdev *subdev)
@@ -484,11 +589,14 @@ static const struct pixel_format pixel_formats[] = {
 	{ MIPI_CSI_DT_RAW_8, "RAW8" },
 	{ MIPI_CSI_DT_RAW_10, "RAW10" },
 	{ MIPI_CSI_DT_RAW_12, "RAW12" },
-	{ MIPI_CSI_DT_RAW_14, "RAW14 "}
+	{ MIPI_CSI_DT_RAW_14, "RAW14"},
+	{ MIPI_CSI_DT_RAW_16, "RAW16"},
+	{ MIPI_CSI_DT_RAW_20, "RAW20"}
 };
 
 static struct xcsi2rxss_event xcsi2rxss_events[] = {
 	{ XCSI_ISR_FR_MASK, "Frame Received", 0 },
+	{ XCSI_ISR_VCX_MASK, "VCX Frame Errors", 0 },
 	{ XCSI_ISR_ILC_MASK, "Invalid Lane Count Error", 0 },
 	{ XCSI_ISR_SPFIFOF_MASK, "Short Packet FIFO OverFlow Error", 0 },
 	{ XCSI_ISR_SPFIFONE_MASK, "Short Packet FIFO Not Empty", 0 },
@@ -511,6 +619,14 @@ static struct xcsi2rxss_event xcsi2rxss_events[] = {
 };
 
 #define XMIPICSISS_NUM_EVENTS ARRAY_SIZE(xcsi2rxss_events)
+
+#define XMIPICSISS_VCX_START		(4)
+#define XMIPICSISS_MAX_VC		(4)
+#define XMIPICSISS_MAX_VCX		(16)
+
+/* There are 2 events frame sync and frame level error per VC */
+#define XMIPICSISS_VCX_NUM_EVENTS	((XMIPICSISS_MAX_VCX -\
+					 XMIPICSISS_MAX_VC) * 2)
 
 /**
  * xcsi2rxss_clr_and_set - Clear and set the register with a bitmask
@@ -657,6 +773,12 @@ static int xcsi2rxss_reset(struct xcsi2rxss_core *core)
 	return 0;
 }
 
+static void xcsi2rxss_stop_stream(struct xcsi2rxss_state *xcsi2rxss)
+{
+	xcsi2rxss_interrupts_enable(&xcsi2rxss->core, false);
+	xcsi2rxss_enable(&xcsi2rxss->core, false);
+}
+
 /**
  * xcsi2rxss_irq_handler - Interrupt handler for CSI-2
  * @irq: IRQ number
@@ -705,6 +827,14 @@ static irqreturn_t xcsi2rxss_irq_handler(int irq, void *dev_id)
 
 	if (status & XCSI_ISR_SLBF_MASK) {
 		dev_alert(core->dev, "Stream Line Buffer Full!\n");
+		if (core->rst_gpio) {
+			gpiod_set_value(core->rst_gpio, 1);
+			/* minimum 40 dphy_clk_200M cycles */
+			ndelay(250);
+			gpiod_set_value(core->rst_gpio, 0);
+		}
+
+		xcsi2rxss_stop_stream(state);
 
 		memset(&state->event, 0, sizeof(state->event));
 
@@ -723,6 +853,19 @@ static irqreturn_t xcsi2rxss_irq_handler(int irq, void *dev_id)
 			dev_dbg(core->dev, "%s: %d\n", core->events[i].name,
 					core->events[i].counter);
 		}
+
+		if (status & XCSI_ISR_VCX_MASK && core->en_vcx) {
+			u32 vcxstatus;
+
+			vcxstatus = xcsi2rxss_read(core, XCSI_VCXR_OFFSET);
+			vcxstatus &= XCSI_VCXR_MASK;
+			for (i = 0; i < XMIPICSISS_VCX_NUM_EVENTS; i++) {
+				if (!(vcxstatus & core->vcx_events[i].mask))
+					continue;
+				core->vcx_events[i].counter++;
+			}
+			xcsi2rxss_write(core, XCSI_VCXR_OFFSET, vcxstatus);
+		}
 	}
 
 	xcsi2rxss_write(core, XCSI_ISR_OFFSET, status);
@@ -737,6 +880,11 @@ static void xcsi2rxss_reset_event_counters(struct xcsi2rxss_state *state)
 	for (i = 0; i < XMIPICSISS_NUM_EVENTS; i++)
 		state->core.events[i].counter = 0;
 
+	if (!state->core.en_vcx)
+		return;
+
+	for (i = 0; i < XMIPICSISS_VCX_NUM_EVENTS; i++)
+		state->core.vcx_events[i].counter = 0;
 }
 
 /**
@@ -754,6 +902,18 @@ static void xcsi2rxss_log_counters(struct xcsi2rxss_state *state)
 				  state->core.events[i].name,
 				  state->core.events[i].counter);
 	}
+
+	if (!state->core.en_vcx)
+		return;
+
+	for (i = 0; i < XMIPICSISS_VCX_NUM_EVENTS; i++) {
+		if (state->core.vcx_events[i].counter > 0)
+			v4l2_info(&state->subdev,
+				  "VC %d Frame %s error vcx events: %d\n",
+				  (i / 2) + XMIPICSISS_VCX_START,
+				  i & 1 ? "Sync" : "Level",
+				  state->core.vcx_events[i].counter);
+	}
 }
 
 /**
@@ -768,7 +928,7 @@ static int xcsi2rxss_log_status(struct v4l2_subdev *sd)
 {
 	struct xcsi2rxss_state *xcsi2rxss = to_xcsi2rxssstate(sd);
 	struct xcsi2rxss_core *core = &xcsi2rxss->core;
-	u32 reg, data, i;
+	u32 reg, data, i, max_vc;
 
 	mutex_lock(&xcsi2rxss->lock);
 
@@ -809,8 +969,13 @@ static int xcsi2rxss_log_status(struct v4l2_subdev *sd)
 	/* Virtual Channel Image Information */
 	v4l2_info(sd, "********** Virtual Channel Info ************\n");
 	v4l2_info(sd, "VC\tLine Count\tByte Count\tData Type\n");
+	if (core->en_vcx)
+		max_vc = XMIPICSISS_MAX_VCX;
+	else
+		max_vc = XMIPICSISS_MAX_VC;
+
 	reg = XCSI_VC0INF1R_OFFSET;
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < max_vc; i++) {
 		u32 line_count, byte_count, data_type;
 		char *datatypestr;
 
@@ -1067,11 +1232,6 @@ static int xcsi2rxss_start_stream(struct xcsi2rxss_state *xcsi2rxss)
 	return 0;
 }
 
-static void xcsi2rxss_stop_stream(struct xcsi2rxss_state *xcsi2rxss)
-{
-	xcsi2rxss_interrupts_enable(&xcsi2rxss->core, false);
-	xcsi2rxss_enable(&xcsi2rxss->core, false);
-}
 
 /**
  * xcsi2rxss_s_stream - It is used to start/stop the streaming.
@@ -1107,6 +1267,14 @@ static int xcsi2rxss_s_stream(struct v4l2_subdev *sd, int enable)
 		}
 	} else {
 		if (xcsi2rxss->streaming) {
+			struct gpio_desc *rst = xcsi2rxss->core.rst_gpio;
+
+			if (rst) {
+				gpiod_set_value_cansleep(rst, 1);
+				usleep_range(1, 2);
+				gpiod_set_value_cansleep(rst, 0);
+			}
+
 			xcsi2rxss_stop_stream(xcsi2rxss);
 			xcsi2rxss->streaming = false;
 		}
@@ -1125,7 +1293,7 @@ __xcsi2rxss_get_pad_format(struct xcsi2rxss_state *xcsi2rxss,
 	case V4L2_SUBDEV_FORMAT_TRY:
 		return v4l2_subdev_get_try_format(&xcsi2rxss->subdev, cfg, pad);
 	case V4L2_SUBDEV_FORMAT_ACTIVE:
-		return &xcsi2rxss->formats[pad];
+		return &xcsi2rxss->formats;
 	default:
 		return NULL;
 	}
@@ -1190,6 +1358,15 @@ static int xcsi2rxss_set_format(struct v4l2_subdev *sd,
 	__format = __xcsi2rxss_get_pad_format(xcsi2rxss, cfg,
 						fmt->pad, fmt->which);
 
+	/*
+	 * If trying to set format on source pad, then
+	 * return the format set on sink pad
+	 */
+	if (fmt->pad == 0) {
+		fmt->format = *__format;
+		goto unlock_set_fmt;
+	}
+
 	/* Save the pad format code */
 	code = __format->code;
 
@@ -1215,7 +1392,12 @@ static int xcsi2rxss_set_format(struct v4l2_subdev *sd,
 		((fmt->format.code == MEDIA_BUS_FMT_SBGGR12_1X12) ||
 		 (fmt->format.code == MEDIA_BUS_FMT_SGBRG12_1X12) ||
 		 (fmt->format.code == MEDIA_BUS_FMT_SGRBG12_1X12) ||
-		 (fmt->format.code == MEDIA_BUS_FMT_SRGGB12_1X12))))
+		 (fmt->format.code == MEDIA_BUS_FMT_SRGGB12_1X12))) ||
+	((core->datatype == MIPI_CSI_DT_RAW_16) &&
+		((fmt->format.code == MEDIA_BUS_FMT_SBGGR16_1X16) ||
+		 (fmt->format.code == MEDIA_BUS_FMT_SGBRG16_1X16) ||
+		 (fmt->format.code == MEDIA_BUS_FMT_SGRBG16_1X16) ||
+		 (fmt->format.code == MEDIA_BUS_FMT_SRGGB16_1X16))))
 
 		/* Copy over the format to be set */
 		*__format = fmt->format;
@@ -1223,8 +1405,11 @@ static int xcsi2rxss_set_format(struct v4l2_subdev *sd,
 		/* Restore the original pad format code */
 		fmt->format.code = code;
 		__format->code = code;
+		__format->width = fmt->format.width;
+		__format->height = fmt->format.height;
 	}
 
+unlock_set_fmt:
 	mutex_unlock(&xcsi2rxss->lock);
 
 	return 0;
@@ -1402,6 +1587,34 @@ static int xcsi2rxss_parse_of(struct xcsi2rxss_state *xcsi2rxss)
 	int ret;
 	bool iic_present;
 
+	if (core->cfg->flags & XCSI_CLK_PROP) {
+		core->lite_aclk = devm_clk_get(core->dev, "lite_aclk");
+		if (IS_ERR(core->lite_aclk)) {
+			ret = PTR_ERR(core->lite_aclk);
+			dev_err(core->dev, "failed to get lite_aclk (%d)\n",
+				ret);
+			return ret;
+		}
+
+		core->video_aclk = devm_clk_get(core->dev, "video_aclk");
+		if (IS_ERR(core->video_aclk)) {
+			ret = PTR_ERR(core->video_aclk);
+			dev_err(core->dev, "failed to get video_aclk (%d)\n",
+				ret);
+			return ret;
+		}
+
+		core->dphy_clk_200M = devm_clk_get(core->dev, "dphy_clk_200M");
+		if (IS_ERR(core->dphy_clk_200M)) {
+			ret = PTR_ERR(core->dphy_clk_200M);
+			dev_err(core->dev, "failed to get dphy_clk_200M (%d)\n",
+				ret);
+			return ret;
+		}
+	} else {
+		dev_info(core->dev, "assuming all required clocks are enabled!\n");
+	}
+
 	core->dphy_present = of_property_read_bool(node, "xlnx,dphy-present");
 	dev_dbg(core->dev, "DPHY present property = %s\n",
 			core->dphy_present ? "Present" : "Absent");
@@ -1430,12 +1643,15 @@ static int xcsi2rxss_parse_of(struct xcsi2rxss_state *xcsi2rxss)
 		return -EINVAL;
 	}
 
+	core->en_vcx = of_property_read_bool(node, "xlnx,en-vcx");
+
 	ret = of_property_read_u32(node, "xlnx,vc", &core->vc);
 	if (ret < 0) {
 		dev_err(core->dev, "missing xlnx,vc property\n");
 		return ret;
 	}
-	if (core->vc > 4) {
+	if ((core->vc > XMIPICSISS_MAX_VC && !core->en_vcx) ||
+	    (core->vc > XMIPICSISS_MAX_VCX && core->en_vcx)) {
 		dev_err(core->dev, "invalid virtual channel property value.\n");
 		return -EINVAL;
 	}
@@ -1454,7 +1670,7 @@ static int xcsi2rxss_parse_of(struct xcsi2rxss_state *xcsi2rxss)
 
 	core->datatype = xcsi2rxss_pxlfmtstrtodt(core->pxlformat);
 	if ((core->datatype < MIPI_CSI_DT_YUV_420_8B) ||
-		(core->datatype > MIPI_CSI_DT_RAW_14)) {
+		(core->datatype > MIPI_CSI_DT_RAW_20)) {
 		dev_err(core->dev, "Invalid xlnx,csi-pxl-format string\n");
 		return -EINVAL;
 	}
@@ -1575,6 +1791,15 @@ static int xcsi2rxss_parse_of(struct xcsi2rxss_state *xcsi2rxss)
 		return ret;
 	}
 
+	/* Reset GPIO */
+	core->rst_gpio = devm_gpiod_get_optional(core->dev, "reset",
+						 GPIOD_OUT_HIGH);
+	if (IS_ERR(core->rst_gpio)) {
+		if (PTR_ERR(core->rst_gpio) != -EPROBE_DEFER)
+			dev_err(core->dev, "Reset GPIO not setup in DT");
+		return PTR_ERR(core->rst_gpio);
+	}
+
 	return 0;
 }
 
@@ -1583,7 +1808,8 @@ static int xcsi2rxss_probe(struct platform_device *pdev)
 	struct v4l2_subdev *subdev;
 	struct xcsi2rxss_state *xcsi2rxss;
 	struct resource *res;
-
+	const struct of_device_id *match;
+	struct device_node *node = pdev->dev.of_node;
 	u32 i;
 	int ret;
 	int num_ctrls;
@@ -1596,6 +1822,12 @@ static int xcsi2rxss_probe(struct platform_device *pdev)
 
 	xcsi2rxss->core.dev = &pdev->dev;
 
+	match = of_match_node(xcsi2rxss_of_id_table, node);
+	if (!match)
+		return -ENODEV;
+
+	xcsi2rxss->core.cfg = match->data;
+
 	ret = xcsi2rxss_parse_of(xcsi2rxss);
 	if (ret < 0)
 		return ret;
@@ -1605,12 +1837,79 @@ static int xcsi2rxss_probe(struct platform_device *pdev)
 	if (IS_ERR(xcsi2rxss->core.iomem))
 		return PTR_ERR(xcsi2rxss->core.iomem);
 
+	if (xcsi2rxss->core.cfg->flags & XCSI_CLK_PROP) {
+		unsigned long rate;
+
+		ret = clk_prepare_enable(xcsi2rxss->core.lite_aclk);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to enable lite_aclk (%d)\n",
+				ret);
+			goto clk_err;
+		}
+
+		ret = clk_prepare_enable(xcsi2rxss->core.video_aclk);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to enable video_aclk (%d)\n",
+				ret);
+			goto video_aclk_err;
+		}
+
+		ret = clk_prepare_enable(xcsi2rxss->core.dphy_clk_200M);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to enable dphy clk (%d)\n",
+				ret);
+			goto dphy_clk_err;
+		}
+
+		ret = clk_set_rate(xcsi2rxss->core.dphy_clk_200M,
+				   XCSI_DPHY_CLK_REQ);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to set dphy clk rate (%d)\n",
+				ret);
+
+			goto all_clk_err;
+		}
+
+		rate = clk_get_rate(xcsi2rxss->core.dphy_clk_200M);
+		if (rate < XCSI_DPHY_CLK_MIN && rate > XCSI_DPHY_CLK_MAX) {
+			dev_err(&pdev->dev, "Err DPHY Clock = %lu\n",
+				rate);
+			ret = -EINVAL;
+			goto all_clk_err;
+		}
+	}
+
 	/*
 	 * Reset and initialize the core.
 	 */
+
+	if (xcsi2rxss->core.rst_gpio) {
+		gpiod_set_value_cansleep(xcsi2rxss->core.rst_gpio, 1);
+		/* minimum of 40 dphy_clk_200M cycles */
+		usleep_range(1, 2);
+		gpiod_set_value_cansleep(xcsi2rxss->core.rst_gpio, 0);
+	}
+
 	xcsi2rxss_reset(&xcsi2rxss->core);
 
 	xcsi2rxss->core.events =  (struct xcsi2rxss_event *)&xcsi2rxss_events;
+
+	if (xcsi2rxss->core.en_vcx) {
+		u32 alloc_size;
+
+		alloc_size = sizeof(struct xcsi2rxss_event) *
+			     XMIPICSISS_VCX_NUM_EVENTS;
+		xcsi2rxss->core.vcx_events = devm_kzalloc(&pdev->dev,
+							  alloc_size,
+							  GFP_KERNEL);
+		if (!xcsi2rxss->core.vcx_events) {
+			mutex_destroy(&xcsi2rxss->lock);
+			return -ENOMEM;
+		}
+
+		for (i = 0; i < XMIPICSISS_VCX_NUM_EVENTS; i++)
+			xcsi2rxss->core.vcx_events[i].mask = 1 << i;
+	}
 
 	/* Initialize V4L2 subdevice and media entity */
 	xcsi2rxss->pads[0].flags = MEDIA_PAD_FL_SOURCE;
@@ -1625,8 +1924,7 @@ static int xcsi2rxss_probe(struct platform_device *pdev)
 	xcsi2rxss->default_format.width = XCSI_DEFAULT_WIDTH;
 	xcsi2rxss->default_format.height = XCSI_DEFAULT_HEIGHT;
 
-	xcsi2rxss->formats[0] = xcsi2rxss->default_format;
-	xcsi2rxss->formats[1] = xcsi2rxss->default_format;
+	xcsi2rxss->formats = xcsi2rxss->default_format;
 
 	/* Initialize V4L2 subdevice and media entity */
 	subdev = &xcsi2rxss->subdev;
@@ -1669,6 +1967,8 @@ static int xcsi2rxss_probe(struct platform_device *pdev)
 
 			if (xcsi2rxss->core.enable_active_lanes) {
 				xcsi2rxss_ctrls[i].max =
+					xcsi2rxss->core.max_num_lanes;
+				xcsi2rxss_ctrls[i].def =
 					xcsi2rxss->core.max_num_lanes;
 			} else {
 				/* Don't register control */
@@ -1725,6 +2025,13 @@ error:
 	media_entity_cleanup(&subdev->entity);
 	mutex_destroy(&xcsi2rxss->lock);
 
+all_clk_err:
+	clk_disable_unprepare(xcsi2rxss->core.dphy_clk_200M);
+dphy_clk_err:
+	clk_disable_unprepare(xcsi2rxss->core.video_aclk);
+video_aclk_err:
+	clk_disable_unprepare(xcsi2rxss->core.lite_aclk);
+clk_err:
 	return ret;
 }
 
@@ -1737,19 +2044,15 @@ static int xcsi2rxss_remove(struct platform_device *pdev)
 	v4l2_ctrl_handler_free(&xcsi2rxss->ctrl_handler);
 	media_entity_cleanup(&subdev->entity);
 	mutex_destroy(&xcsi2rxss->lock);
+	clk_disable_unprepare(xcsi2rxss->core.dphy_clk_200M);
+	clk_disable_unprepare(xcsi2rxss->core.video_aclk);
+	clk_disable_unprepare(xcsi2rxss->core.lite_aclk);
 
 	return 0;
 }
 
 static SIMPLE_DEV_PM_OPS(xcsi2rxss_pm_ops,
 			 xcsi2rxss_pm_suspend, xcsi2rxss_pm_resume);
-
-static const struct of_device_id xcsi2rxss_of_id_table[] = {
-	{ .compatible = "xlnx,mipi-csi2-rx-subsystem-2.0" },
-	{ .compatible = "xlnx,mipi-csi2-rx-subsystem-3.0" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, xcsi2rxss_of_id_table);
 
 static struct platform_driver xcsi2rxss_driver = {
 	.driver = {

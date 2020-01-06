@@ -55,6 +55,8 @@ struct skcipher_givcrypt_request {
 struct crypto_skcipher {
 	int (*setkey)(struct crypto_skcipher *tfm, const u8 *key,
 	              unsigned int keylen);
+	int (*setkeytype)(struct crypto_skcipher *tfm, const u8 *key,
+			  unsigned int keylen);
 	int (*encrypt)(struct skcipher_request *req);
 	int (*decrypt)(struct skcipher_request *req);
 
@@ -401,9 +403,10 @@ static inline int crypto_skcipher_setkey(struct crypto_skcipher *tfm,
 	return tfm->setkey(tfm, key, keylen);
 }
 
-static inline bool crypto_skcipher_has_setkey(struct crypto_skcipher *tfm)
+static inline int crypto_skcipher_setkeytype(struct crypto_skcipher *tfm,
+					     const u8 *key, unsigned int keylen)
 {
-	return tfm->keysize;
+	return tfm->setkeytype(tfm, key, keylen);
 }
 
 static inline unsigned int crypto_skcipher_default_keysize(
@@ -442,6 +445,9 @@ static inline int crypto_skcipher_encrypt(struct skcipher_request *req)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
 
+	if (crypto_skcipher_get_flags(tfm) & CRYPTO_TFM_NEED_KEY)
+		return -ENOKEY;
+
 	return tfm->encrypt(req);
 }
 
@@ -459,6 +465,9 @@ static inline int crypto_skcipher_encrypt(struct skcipher_request *req)
 static inline int crypto_skcipher_decrypt(struct skcipher_request *req)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+
+	if (crypto_skcipher_get_flags(tfm) & CRYPTO_TFM_NEED_KEY)
+		return -ENOKEY;
 
 	return tfm->decrypt(req);
 }
