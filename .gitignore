@@ -132,3 +132,10 @@ all.config
 
 # Kdevelop4
 *.kdev4
+
+# Visual Studio Code
+.vscode
+
+# Track Travis CI config
+!.travis.yml
+!.travis.yaml
