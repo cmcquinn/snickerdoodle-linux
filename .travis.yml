@@ -1,5 +1,3 @@
 language: c
-compiler:
-- clang
-- gcc
-script: make kernelversion
+services: docker
+script: "./build/build.sh"

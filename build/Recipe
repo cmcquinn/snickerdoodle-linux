@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -x
+
+export ARCH=arm
+export CROSS_COMPILE=arm-linux-gnueabihf-
+export LOADADDR=0x8000
+export LOCALVERSION="-replicookie"
+export KBUILD_IMAGE=uImage
+
+JOBS=$((`nproc`+1))
+
+make -j${JOBS} snickerdoodle_replicookie_defconfig
+make -j${JOBS} scripts
+make -j${JOBS} deb-pkg
