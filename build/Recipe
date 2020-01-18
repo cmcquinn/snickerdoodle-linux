@@ -8,6 +8,13 @@ export LOADADDR=0x8000
 export LOCALVERSION="-replicookie"
 export KBUILD_IMAGE=uImage
 
+# get wl18xx firmware binaries
+mkdir -p firmware/ti-connectivity
+curl -L "https://dl.bintray.com/cmcquinn/snickerdoodle-wilink/wilink8fw.tar.gz" -o fw.tar.gz
+tar xf fw.tar.gz
+mv wl18xx-fw-4.bin wl18xx-conf.bin wl1271-nvs.bin firmware/ti-connectivity
+rm fw.tar.gz
+
 JOBS=$((`nproc`+1))
 
 make -j${JOBS} snickerdoodle_replicookie_defconfig

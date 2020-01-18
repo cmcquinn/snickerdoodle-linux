@@ -5,13 +5,6 @@ set -x # echo commands
 docker_image=cmcquinn/snickerdoodle-docker:kernel
 project=snickerdoodle-linux
 
-# get wl18xx firmware binaries
-mkdir -p firmware/ti-connectivity
-curl -L "https://dl.bintray.com/cmcquinn/snickerdoodle-wilink/wilink8fw.tar.gz" -o fw.tar.gz
-tar xf fw.tar.gz
-mv wl18xx-fw-4.bin wl18xx-conf.bin wl1271-nvs.bin firmware/ti-connectivity
-rm wilink8fw.tar.gz
-
 docker pull ${docker_image}
 docker rm ${project} &> /dev/null || true
 docker run --privileged --name ${project} -i \
