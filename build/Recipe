@@ -20,4 +20,5 @@ JOBS=$((`nproc`+1))
 make -j${JOBS} snickerdoodle_replicookie_defconfig
 make -j${JOBS} scripts
 make -j${JOBS} uImage modules
-make -j${JOBS} deb-pkg
+make -j${JOBS} dtbs
+make -j${JOBS} bindeb-pkg
